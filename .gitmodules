@@ -1,0 +1,3 @@
+[submodule "nested_child_repo_10_LOC"]
+	path = nested_child_repo_10_LOC
+	url = https://github.com/lakshya-blitzy/nested_child_repo_10_LOC.git
