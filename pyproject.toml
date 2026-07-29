@@ -1,0 +1,18 @@
+# Identity manifest for this Python application.
+#
+# Declared source of the `name` and `version` fields carried by the /health
+# endpoint's JSON response: health.py reads this file once at import time with
+# the standard-library `tomllib` module, resolving the path from its own module
+# location, and falls back to compiled-in literals if the read ever fails.
+#
+# Deliberately minimal: this repository is an application launched directly with
+# `python server.py`, not a distributable package, so it declares no build
+# backend, no runtime requirements and no tooling sections. Adding any of those
+# would pull in the first third-party package this repository has ever had.
+
+[project]
+name = "child_repo_10_LOC"
+version = "1.0.0"
+
+# `tomllib` entered the standard library in CPython 3.11, which sets this floor.
+requires-python = ">=3.11"
