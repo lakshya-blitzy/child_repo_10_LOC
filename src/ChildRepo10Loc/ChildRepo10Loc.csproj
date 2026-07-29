@@ -1,0 +1,9 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <RootNamespace>ChildRepo10Loc</RootNamespace>
+    <AssemblyName>ChildRepo10Loc</AssemblyName>
+  </PropertyGroup>
+
+</Project>
