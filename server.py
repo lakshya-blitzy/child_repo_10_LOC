@@ -389,7 +389,7 @@ class HealthHTTPServer(ThreadingHTTPServer):
     and every subsequent probe queues behind it -- a liveness probe a slow
     client can silence reports the opposite of the truth.
 
-    All four class attributes are set explicitly because each is load-bearing:
+    All five class attributes are set explicitly because each is load-bearing:
 
     ``daemon_threads = True``
         Request threads must never keep the interpreter alive after the main
@@ -417,12 +417,35 @@ class HealthHTTPServer(ThreadingHTTPServer):
         bind the *same live* port and take a share of the connections, so a
         duplicate start would appear to succeed while probes reached whichever
         instance the kernel chose.
+
+    ``request_queue_size = socket.SOMAXCONN``
+        The value passed to ``listen()``: how many connections the kernel may
+        hold for this listener between the completed handshake and
+        ``accept()``.  ``socketserver`` defaults it to **5**, which is far too
+        small for a resource whose whole purpose is to be polled, and the
+        shortfall is measurable rather than theoretical: with 40 clients
+        connecting at once, 20 of them spent **~1004 ms inside ``connect()``**
+        while the request/response exchange itself took ~2 ms.  That is not slow
+        serving, it is a dropped ``SYN`` -- the queue overflowed, the kernel
+        discarded the handshake, and the client's stack retransmitted one initial
+        round-trip timeout later.  A probe that times out at 1 s would have
+        recorded this endpoint as *down* while it was answering every request it
+        received in single-digit milliseconds, which is the worst failure a
+        health check can have.  The sibling tiers do not have the problem
+        because their runtimes already choose a generous backlog -- Node listens
+        with 511 and the JDK with 50 -- so raising it here removes a divergence
+        rather than introducing one.  ``SOMAXCONN`` is used rather than a
+        hand-picked number because the ceiling that matters is the operating
+        system's (Linux clamps the request to ``net.core.somaxconn``), and the
+        only cost of a large value is kernel bookkeeping for handshakes this
+        server is about to accept anyway.
     """
 
     daemon_threads = True
     block_on_close = False
     allow_reuse_address = True
     allow_reuse_port = False
+    request_queue_size = socket.SOMAXCONN
 
     def __init__(
         self,

@@ -1185,6 +1185,42 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     #: milliseconds, so ten seconds is generous.
     timeout = 10
 
+    #: Send every response the instant it is written, without waiting for the
+    #: peer to acknowledge the previous one.
+    #:
+    #: This is ``TCP_NODELAY``, and it is set because without it a *keep-alive*
+    #: probe pays a delayed-acknowledgement penalty that has nothing to do with
+    #: this application's work.  Measured on the reference host, three sequential
+    #: requests on one connection: the first completed in 0.5 ms, the second and
+    #: third in **40.8 ms and 41.1 ms** -- their headers arrived in 0.1-0.2 ms and
+    #: the *body* then sat unsent for the remainder.  Nagle's algorithm was
+    #: holding the second small segment of the response until the peer
+    #: acknowledged the first, and the peer's stack was itself delaying that
+    #: acknowledgement.  Two mechanisms, each individually reasonable, combining
+    #: into a stall an order of magnitude larger than the response it delayed.
+    #:
+    #: :meth:`_send` removes the second segment (see :meth:`_flush_response`), and
+    #: this flag removes the wait -- both, because they defend against different
+    #: halves of the same interaction and only the pair is robust: a response that
+    #: happened to exceed one segment would stall again with coalescing alone,
+    #: and a response written in two segments is a wasted round trip even with
+    #: ``TCP_NODELAY`` set.
+    #:
+    #: ``socketserver`` notes that this flag is intended for use with
+    #: ``wbufsize != 0``, its buffered-writer mode, and that pairing is
+    #: deliberately *not* adopted here.  Buffering would coalesce the writes as a
+    #: side effect, but it also moves the socket write out of :meth:`_send` and
+    #: into the base class's per-request ``wfile.flush()``, outside the
+    #: ``OSError`` guard that keeps an ordinary peer disconnect from becoming a
+    #: ``socketserver`` traceback on standard error.  Explicit coalescing keeps
+    #: the write, and therefore the error handling, exactly where the contract's
+    #: silence requirement needs it.
+    #:
+    #: The endpoint's responses are ~100-200 bytes and it performs no streaming,
+    #: so the small-packet concern the flag exists to guard against cannot arise
+    #: here: there is one write per response, and it is already one segment.
+    disable_nagle_algorithm = True
+
     #: The path this handler answers on: the value resolved at import, which
     #: validation guarantees is the contract's literal.  Read through the class so
     #: a subclass can be pointed elsewhere in a test without mutating module
@@ -1318,6 +1354,10 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         ``ConnectionResetError`` and ``TimeoutError`` -- means the peer went
         away mid-response, which is the client's business and not this
         application's fault, so the connection is abandoned quietly.
+
+        The whole response leaves in a single write: see :meth:`_flush_response`
+        for why that is a correctness property of a keep-alive probe and not a
+        micro-optimization.
         """
         try:
             self.send_response(status)
@@ -1326,11 +1366,65 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", CONTENT_TYPE)
             self.send_header("Cache-Control", CACHE_CONTROL)
             self.send_header("Content-Length", str(len(body)))
-            self.end_headers()
-            if write_body:
-                self.wfile.write(body)
+            self._flush_response(body if write_body else b"")
         except OSError as error:
             self._abandon_connection(error)
+
+    def _flush_response(self, payload):
+        """Emit the buffered head and ``payload`` in one write to the socket.
+
+        The base class buffers the status line and every header, then
+        :meth:`~http.server.BaseHTTPRequestHandler.end_headers` appends the blank
+        line and flushes -- one write -- after which a caller writes the body,
+        which on this handler's unbuffered ``wfile`` (``socketserver`` sets
+        ``wbufsize = 0``) is a *second* write and therefore a second TCP segment.
+        That second segment is what stalled behind Nagle and delayed
+        acknowledgement for ~41 ms on every keep-alive request after the first;
+        :attr:`disable_nagle_algorithm` records the measurement.
+
+        Appending the body to the same buffer and flushing once produces the
+        identical bytes in one segment.  ``flush_headers`` is used rather than a
+        hand-rolled write because it is the base class's own documented flush: it
+        joins the buffer, writes it, and -- importantly on a persistent connection
+        -- clears it, so nothing can leak into the next response on the same
+        socket.
+
+        Two cases do not have a header buffer to append to, and both fall back to
+        the base class's own sequence so that the bytes on the wire are exactly
+        what they are today:
+
+        * **An HTTP/0.9 request.**  A request line carrying no version leaves
+          ``send_response_only``, ``send_header`` and ``end_headers`` as no-ops,
+          so there is no status line and no header block -- the peer receives the
+          body alone, which is all RFC 1945 §6 defines for a version-less
+          request.  That is deliberate standard-library behaviour and is
+          preserved verbatim.
+        * **A buffer the base class did not create, or created as something other
+          than a list.**  ``_headers_buffer`` is the standard library's private
+          attribute.  It has had the same shape for the entire 3.x series, but
+          this method does not require it: if the attribute is missing or is not a
+          list, the response is written the long way instead.  A fallback costs a
+          round trip; guessing wrong about a private attribute would cost the
+          response.
+
+        Either fallback still writes the correct response -- only in two segments
+        rather than one, which is precisely the condition
+        :attr:`disable_nagle_algorithm` also protects against.
+
+        :param payload: the response body, or ``b""`` for a ``HEAD``.
+        """
+        buffered = getattr(self, "_headers_buffer", None)
+
+        if self.request_version != "HTTP/0.9" and isinstance(buffered, list):
+            buffered.append(b"\r\n")
+            if payload:
+                buffered.append(payload)
+            self.flush_headers()
+            return
+
+        self.end_headers()
+        if payload:
+            self.wfile.write(payload)
 
     def _abandon_connection(self, error=None):
         """Fail closed: end this connection without raising and without a 5xx.

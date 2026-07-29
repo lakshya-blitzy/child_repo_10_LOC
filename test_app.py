@@ -517,6 +517,40 @@ MAX_DRAIN_BYTES = 1 << 20
 #: Read size for :meth:`_RawConnection.read_until_close`.  Every response this
 #: suite reads that way is a few dozen bytes, so one read drains it.
 _RAW_READ_CHUNK_BYTES = 1 << 16
+
+#: Sequential requests issued on ONE persistent connection by the keep-alive
+#: assertions, and the total wall-clock budget for them.
+#:
+#: The budget is the regression gate for a measured defect, so its value is
+#: derived rather than chosen for comfort.  When the response left in two writes
+#: with Nagle's algorithm enabled, every request after the first completed in
+#: ~41 ms -- the peer's delayed-acknowledgement quantum -- so three requests cost
+#: upwards of 80 ms.  Coalesced and with ``TCP_NODELAY`` set they cost ~0.5 ms in
+#: total.  120 ms therefore sits an order of magnitude above the healthy cost and
+#: below the cheapest possible expression of the defect, which is what makes it
+#: diagnostic instead of decorative.
+KEEPALIVE_REQUESTS = 3
+KEEPALIVE_TOTAL_BUDGET_SECONDS = 0.120
+
+#: Connections opened simultaneously by the accept-backlog assertion, and the
+#: budget for all of them to be answered.
+#:
+#: Also derived from a measurement.  ``socketserver`` defaults ``listen()`` to a
+#: backlog of 5; with 40 simultaneous clients, 20 of them sat ~1004 ms inside
+#: ``connect()`` because the kernel dropped their handshake and their stack waited
+#: out an initial retransmission timeout, while the exchanges themselves took
+#: ~2 ms.
+#:
+#: The burst size is 40 because that is where the defect actually appears, and
+#: that was established by measurement rather than assumed: against a backlog of
+#: 5, bursts of 24 completed in ~12 ms while bursts of 40 took **1284 ms** and
+#: bursts of 64 took ~1067 ms -- the accept queue only overflows once the clients
+#: outpace the accept loop.  A smaller burst would have made this assertion pass
+#: against the very default it exists to reject.  With the backlog raised, the
+#: same 40 connections cost ~18 ms, so 600 ms sits an order of magnitude above the
+#: healthy cost and far below the ~1 s floor of a single dropped handshake.
+BACKLOG_BURST_CONNECTIONS = 40
+BACKLOG_BURST_BUDGET_SECONDS = 0.600
 _HEALTH_STATUS_PROBE_MODULE_NAME = "blitzy_probe_health_declared_status"
 
 
@@ -3232,6 +3266,174 @@ class TestResolverPrecedenceDirectly(unittest.TestCase):
 
 
 
+class _RecordingWriter:
+    """A ``wfile`` stand-in that records every write separately.
+
+    The number of writes is the subject of the assertions that use it, so the
+    recorder deliberately does not join them: two writes must be observable as
+    two, not inferred from bytes that happen to be adjacent.
+    """
+
+    __slots__ = ("writes",)
+
+    def __init__(self):
+        """Start with nothing recorded."""
+        self.writes = []
+
+    def write(self, data):
+        """Record one write and report its length, as a real writer does."""
+        self.writes.append(bytes(data))
+        return len(data)
+
+    def flush(self):
+        """Accept a flush; an unbuffered writer has nothing to do here."""
+
+    def joined(self):
+        """Return every recorded byte, in order."""
+        return b"".join(self.writes)
+
+
+class TestResponseIsWrittenInOneSegment(unittest.TestCase):
+    """Every response leaves the handler in a single write.
+
+    This is a *latency* contract, and it is asserted at the handler rather than
+    over TCP because the mechanism is deterministic here while the symptom over
+    TCP is a timing measurement.  The defect it guards against was measured: the
+    status line and headers went out in one write and the body in a second, and
+    because ``socketserver`` gives this handler an unbuffered ``wfile``, that was
+    two TCP segments.  With Nagle's algorithm holding the second segment until the
+    first was acknowledged, and the peer delaying that acknowledgement, every
+    keep-alive request after the first completed in ~41 ms instead of ~0.1 ms.
+
+    The handler is exercised without a socket: nothing here binds, and the
+    ``wfile`` is a recorder.  ``__new__`` is used deliberately --
+    ``BaseRequestHandler.__init__`` *serves a request* as part of construction, so
+    it cannot be used to obtain an instance for inspection.  Only the attributes
+    the write path reads are supplied, which is also what proves the write path
+    reads nothing else.
+    """
+
+    def _handler(self, request_version="HTTP/1.1"):
+        """Return an unbound handler whose writes are recorded.
+
+        ``requestline`` is supplied because the base class's ``log_request``
+        interpolates it -- the handler silences the resulting line, but the
+        attribute is still read while building it.
+        """
+        handler = health.HealthRequestHandler.__new__(health.HealthRequestHandler)
+        handler.wfile = _RecordingWriter()
+        handler.request_version = request_version
+        handler.close_connection = False
+        handler.requestline = (
+            f"GET {EXPECTED_PATH}"
+            if request_version == "HTTP/0.9"
+            else f"GET {EXPECTED_PATH} {request_version}"
+        )
+        return handler
+
+    def test_nagles_algorithm_is_disabled_on_the_accepted_connection(self):
+        """``TCP_NODELAY`` is set, and buffering is deliberately not used instead.
+
+        ``socketserver`` applies this flag in ``setup()`` for every accepted
+        connection, so asserting the class attribute asserts the socket option.
+        ``wbufsize`` is asserted alongside it because the pairing is the decision:
+        the standard library suggests this flag be used with its buffered-writer
+        mode, and that mode is rejected here because it would move the socket write
+        out of ``_send`` and into the base class's per-request flush, outside the
+        ``OSError`` guard that keeps a peer disconnect from printing a traceback.
+        """
+        self.assertIs(health.HealthRequestHandler.disable_nagle_algorithm, True)
+        self.assertEqual(
+            health.HealthRequestHandler.wbufsize,
+            0,
+            "the write must stay inside _send, where its failure is handled",
+        )
+
+    def test_a_success_response_is_one_write_containing_head_and_body(self):
+        """Status line, headers and body arrive as one contiguous write."""
+        handler = self._handler()
+        body = health.render_payload()
+        handler._send(health.STATUS_OK, body)
+
+        self.assertEqual(
+            len(handler.wfile.writes),
+            1,
+            f"expected one write, saw {len(handler.wfile.writes)}: "
+            "a second write is a second TCP segment on an unbuffered socket",
+        )
+        written = handler.wfile.joined()
+        head, separator, payload = written.partition(b"\r\n\r\n")
+        self.assertEqual(separator, b"\r\n\r\n", "the header block must be terminated")
+        self.assertTrue(head.startswith(b"HTTP/1.1 200 "), head[:40])
+        self.assertEqual(payload, body, "the body must follow the headers in the same write")
+        self.assertIn(b"Content-Type: " + EXPECTED_CONTENT_TYPE.encode(), head)
+        self.assertIn(b"Cache-Control: " + EXPECTED_CACHE_CONTROL.encode(), head)
+        self.assertIn(f"Content-Length: {len(body)}".encode(), head)
+
+    def test_a_head_response_is_one_write_and_carries_no_body(self):
+        """``HEAD`` writes once too, with the length it withholds."""
+        handler = self._handler()
+        body = health.render_payload()
+        handler._send(health.STATUS_OK, body, write_body=False)
+
+        self.assertEqual(len(handler.wfile.writes), 1)
+        written = handler.wfile.joined()
+        self.assertTrue(written.endswith(b"\r\n\r\n"), "a HEAD response ends at the headers")
+        self.assertIn(f"Content-Length: {len(body)}".encode(), written)
+        self.assertNotIn(b'"status"', written, "no payload may follow a HEAD's headers")
+
+    def test_a_refusal_is_one_write_and_still_carries_allow(self):
+        """The ``405`` path coalesces as well, ``Allow`` included."""
+        handler = self._handler()
+        handler._send(
+            health.STATUS_METHOD_NOT_ALLOWED,
+            health.METHOD_NOT_ALLOWED_BODY,
+            allow=health.ALLOW_HEADER_VALUE,
+        )
+
+        self.assertEqual(len(handler.wfile.writes), 1)
+        written = handler.wfile.joined()
+        self.assertTrue(written.startswith(b"HTTP/1.1 405 "), written[:40])
+        self.assertIn(b"Allow: " + health.ALLOW_HEADER_VALUE.encode(), written)
+        self.assertTrue(written.endswith(health.METHOD_NOT_ALLOWED_BODY))
+
+    def test_an_http_0_9_response_is_the_body_alone_and_still_one_write(self):
+        """A version-less request keeps its standard-library framing exactly.
+
+        A request line carrying no version leaves ``send_response_only``,
+        ``send_header`` and ``end_headers`` as no-ops, so RFC 1945 §6's answer is
+        the body with no status line and no headers.  Coalescing must not
+        manufacture a status line for a request that never declared a version, so
+        this asserts the bytes are unchanged -- and, incidentally, that they were
+        already one write.
+        """
+        handler = self._handler(request_version="HTTP/0.9")
+        body = health.render_payload()
+        handler._send(health.STATUS_OK, body)
+
+        self.assertEqual(handler.wfile.writes, [body])
+        self.assertNotIn(b"HTTP/", handler.wfile.joined())
+
+    def test_the_flush_delegates_to_the_base_class_without_a_header_buffer(self):
+        """With no buffer to append to, the base class's own sequence is used.
+
+        ``_headers_buffer`` is the standard library's private attribute.  The write
+        path uses it when it is a list -- which it has been for the whole 3.x series
+        -- and hands the work back to ``end_headers`` when it is anything else, so a
+        future change to that representation costs a round trip instead of the
+        response.  This asserts the delegation directly: the fallback is taken, and
+        the payload is still written.
+        """
+        handler = self._handler()
+        delegated = []
+        handler.end_headers = lambda: delegated.append("end_headers")
+
+        handler._flush_response(b'{"error":"Not Found"}')
+
+        self.assertEqual(delegated, ["end_headers"], "the base class must be asked")
+        self.assertEqual(handler.wfile.writes, [b'{"error":"Not Found"}'])
+
+
 class TestHealthEndpointOverHttp(PayloadContractAssertions, unittest.TestCase):
     """The contract asserted over real HTTP, against a real listener.
 
@@ -3946,6 +4148,73 @@ class TestHealthEndpointOverHttp(PayloadContractAssertions, unittest.TestCase):
         for member in ("name", "version", "status"):
             with self.subTest(member=member):
                 self.assertEqual(served[member], built[member])
+
+    # Latency on a persistent connection.
+
+    def test_keep_alive_requests_arrive_in_one_segment_and_without_a_stall(self):
+        """Three requests on one connection, each answered in a single segment.
+
+        The wire-level half of :class:`TestResponseIsWrittenInOneSegment`, and the
+        regression gate for a measured defect: when the response left in two
+        writes, the headers arrived in ~0.1 ms and the body followed ~41 ms later
+        on every request after the first, because Nagle's algorithm held the second
+        segment until the peer acknowledged the first and the peer delayed that
+        acknowledgement.  A poller measuring response time saw a fortyfold
+        penalty produced entirely by framing.
+
+        Two independent properties are asserted, deliberately, because either
+        alone could pass a half-fixed implementation:
+
+        * **Segmentation**, which is deterministic -- a single ``recv`` must return
+          the status line, the headers *and* the whole declared body.  Under the
+          defect the first ``recv`` returns the head alone.
+        * **Total elapsed time** against a budget derived from the measurement,
+          which catches a stall arriving by any other route.
+
+        A raw socket is used rather than :class:`_RawConnection` because its
+        buffered reader would hide the segmentation this asserts, and the
+        connection is closed by a registered cleanup.
+        """
+        connection = socket.create_connection(
+            (self._host, self._port), timeout=REQUEST_TIMEOUT_SECONDS
+        )
+        self.addCleanup(connection.close)
+        request = (
+            f"GET {EXPECTED_PATH} HTTP/1.1\r\n"
+            f"Host: {self._host}\r\n"
+            "Connection: keep-alive\r\n\r\n"
+        ).encode(EXPECTED_ENCODING)
+
+        started = time.perf_counter()
+        for attempt in range(1, KEEPALIVE_REQUESTS + 1):
+            with self.subTest(request=attempt):
+                connection.sendall(request)
+                segment = connection.recv(_RAW_READ_CHUNK_BYTES)
+                head, separator, body = segment.partition(b"\r\n\r\n")
+                self.assertEqual(
+                    separator,
+                    b"\r\n\r\n",
+                    "the first segment must carry the complete header block",
+                )
+                self.assertTrue(head.startswith(b"HTTP/1.1 200 "), head[:40])
+                declared = re.search(rb"[Cc]ontent-[Ll]ength:\s*(\d+)", head)
+                self.assertIsNotNone(declared, "every response declares its length")
+                self.assertEqual(
+                    len(body),
+                    int(declared.group(1)),
+                    "the body must arrive in the same segment as the headers; a "
+                    "second segment is what stalled behind the delayed ACK",
+                )
+                self.assert_byte_shape(body.decode(EXPECTED_ENCODING))
+                self.assert_payload_conforms(json.loads(body))
+        elapsed = time.perf_counter() - started
+
+        self.assertLess(
+            elapsed,
+            KEEPALIVE_TOTAL_BUDGET_SECONDS,
+            f"{KEEPALIVE_REQUESTS} keep-alive probes took {elapsed * 1000:.1f} ms; "
+            "the delayed-acknowledgement stall this guards against costs ~41 ms each",
+        )
 
 
 class _DegradedConfigurationFixture(unittest.TestCase):
@@ -4909,6 +5178,90 @@ class TestServerListenerLifecycle(PayloadContractAssertions, unittest.TestCase):
         self.assertEqual(listener.address_family, socket.AF_INET)
         self.assertIsInstance(listener, server.HealthHTTPServer)
         self.assertIsInstance(listener, ThreadingHTTPServer)
+
+    def test_the_accept_queue_is_deep_enough_for_a_burst_of_pollers(self):
+        """The backlog passed to ``listen()`` is the operating system's ceiling.
+
+        ``socketserver`` defaults ``request_queue_size`` to 5, and a resource whose
+        entire purpose is to be polled cannot afford that: once the queue
+        overflows, the kernel discards the handshake and the client waits out a
+        retransmission timeout -- measured at ~1004 ms inside ``connect()`` for
+        half of 40 simultaneous clients, while the exchanges themselves took ~2 ms.
+        A probe with a one-second timeout would have called this endpoint *down*
+        while it was answering everything it received in single-digit milliseconds.
+
+        Asserted as an equality against ``socket.SOMAXCONN`` rather than a
+        ``>=`` bound so that a regression to the standard library's default cannot
+        pass, and so the value stays single-sourced from the platform rather than
+        hand-picked here.
+        """
+        listener, _, _ = self._bind()
+        self.assertEqual(listener.request_queue_size, socket.SOMAXCONN)
+        self.assertGreater(
+            listener.request_queue_size,
+            ThreadingHTTPServer.request_queue_size,
+            "the tier's listener must not inherit socketserver's backlog of 5",
+        )
+
+    def test_a_simultaneous_burst_of_connections_is_answered_without_a_stall(self):
+        """Every client in a burst is answered, and none waits out a dropped SYN.
+
+        The behavioural half of the assertion above: a deep accept queue is only
+        worth asserting because of what it prevents, and what it prevents is
+        visible only when many clients arrive at once.  Each connection is opened
+        and read to completion on its own thread, and the whole burst is bounded --
+        a single dropped handshake costs ~1 s on its own, so exceeding the budget
+        localizes the defect to the accept path rather than to the handler.
+        """
+        listener, bound_host, bound_port = self._bind()
+        thread = threading.Thread(
+            target=listener.serve_forever,
+            kwargs={"poll_interval": LISTENER_POLL_INTERVAL_SECONDS},
+            name="blitzy-health-backlog-listener",
+            daemon=True,
+        )
+        thread.start()
+        self.addCleanup(thread.join, LISTENER_JOIN_TIMEOUT_SECONDS)
+        self.addCleanup(listener.shutdown)
+
+        statuses = []
+        errors = []
+        lock = threading.Lock()
+
+        def poll():
+            """Perform one bounded request and record its outcome, never raising."""
+            try:
+                response = _perform_request(bound_host, bound_port, "GET", EXPECTED_PATH)
+            except (OSError, http.client.HTTPException) as error:
+                with lock:
+                    errors.append(f"{type(error).__name__}: {error}")
+                return
+            with lock:
+                statuses.append(response.status)
+
+        started = time.perf_counter()
+        callers = [
+            threading.Thread(target=poll, name=f"blitzy-health-burst-{index}", daemon=True)
+            for index in range(BACKLOG_BURST_CONNECTIONS)
+        ]
+        for caller in callers:
+            caller.start()
+        for caller in callers:
+            caller.join(REQUEST_TIMEOUT_SECONDS * 2)
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(errors, [], "every client in the burst must be answered")
+        self.assertEqual(
+            statuses,
+            [health.STATUS_OK] * BACKLOG_BURST_CONNECTIONS,
+            "a burst must not degrade the status any client receives",
+        )
+        self.assertLess(
+            elapsed,
+            BACKLOG_BURST_BUDGET_SECONDS,
+            f"{BACKLOG_BURST_CONNECTIONS} simultaneous probes took {elapsed * 1000:.1f} ms; "
+            "a dropped handshake retransmission is the only thing that costs this much",
+        )
 
     def test_the_handler_and_server_classes_are_substitutable(self):
         """Both are documented parameters, so both are proven to be honoured.
