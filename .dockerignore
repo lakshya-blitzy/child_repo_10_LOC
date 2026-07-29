@@ -1,0 +1,17 @@
+# Git metadata
+.git
+.gitignore
+.gitmodules
+
+# Submodule subtree (its own repository; not part of this build context)
+nested_child_repo_10_LOC/
+
+# Build output
+**/bin/
+**/obj/
+artifacts/
+
+# Not needed to build or run the application
+tests/
+.github/
+README.md

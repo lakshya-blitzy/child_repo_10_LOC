@@ -1,0 +1,15 @@
+# Build output
+bin/
+obj/
+[Dd]ebug/
+[Rr]elease/
+artifacts/
+
+# Test and diagnostic output
+TestResults/
+*.binlog
+
+# IDE and user-specific files
+*.user
+.vs/
+.idea/
