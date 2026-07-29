@@ -1,0 +1,31 @@
+
+Microsoft Visual Studio Solution File, Format Version 12.00
+# Visual Studio Version 17
+VisualStudioVersion = 17.0.31903.59
+MinimumVisualStudioVersion = 10.0.40219.1
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "ChildRepo10Loc", "src\ChildRepo10Loc\ChildRepo10Loc.csproj", "{7685AD8B-8A82-4D96-8852-E199D09F316C}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "ChildRepo10Loc.Tests", "tests\ChildRepo10Loc.Tests\ChildRepo10Loc.Tests.csproj", "{33D836CD-6162-4D1D-A5AF-CD61CB13CA37}"
+EndProject
+Global
+  GlobalSection(SolutionConfigurationPlatforms) = preSolution
+    Debug|Any CPU = Debug|Any CPU
+    Release|Any CPU = Release|Any CPU
+  EndGlobalSection
+  GlobalSection(ProjectConfigurationPlatforms) = postSolution
+    {7685AD8B-8A82-4D96-8852-E199D09F316C}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+    {7685AD8B-8A82-4D96-8852-E199D09F316C}.Debug|Any CPU.Build.0 = Debug|Any CPU
+    {7685AD8B-8A82-4D96-8852-E199D09F316C}.Release|Any CPU.ActiveCfg = Release|Any CPU
+    {7685AD8B-8A82-4D96-8852-E199D09F316C}.Release|Any CPU.Build.0 = Release|Any CPU
+    {33D836CD-6162-4D1D-A5AF-CD61CB13CA37}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+    {33D836CD-6162-4D1D-A5AF-CD61CB13CA37}.Debug|Any CPU.Build.0 = Debug|Any CPU
+    {33D836CD-6162-4D1D-A5AF-CD61CB13CA37}.Release|Any CPU.ActiveCfg = Release|Any CPU
+    {33D836CD-6162-4D1D-A5AF-CD61CB13CA37}.Release|Any CPU.Build.0 = Release|Any CPU
+  EndGlobalSection
+  GlobalSection(SolutionProperties) = preSolution
+    HideSolutionNode = FALSE
+  EndGlobalSection
+  GlobalSection(ExtensibilityGlobals) = postSolution
+    SolutionGuid = {436943F2-6212-45E1-8444-B06128BD00CA}
+  EndGlobalSection
+EndGlobal
