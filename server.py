@@ -174,6 +174,17 @@ UNSAFE_PORT_TEXT = "<unprintable>"
 #: short name, and a bound protects the log line's legibility.
 _MAX_HOST_LENGTH = 64
 
+#: Longest configured value rendered inside a frozen-value warning.  A rejected
+#: value is quoted so an operator can find it in the document, which needs its
+#: leading characters and not all of them: a document may declare a value of any
+#: length, and an unbounded one would put that length on the error stream at
+#: every start-up.  Matches the bound the other tiers of this composition apply.
+_MAX_CONFIGURED_LENGTH = 64
+
+#: Appended to a configured value that was cut at :data:`_MAX_CONFIGURED_LENGTH`,
+#: so a reader can tell a truncated rendering from a complete one.
+_TRUNCATION_MARK = "..."
+
 #: Characters a renderable host may contain: a DNS name, an IPv4 literal, an
 #: IPv6 literal, or an IPv6 literal with a zone identifier such as
 #: ``fe80::1%eth0``.  Deliberately excludes whitespace and every control
@@ -206,9 +217,12 @@ def _usable_host(value):
 def _usable_port(value):
     """Return ``value`` as an in-range TCP port number, or ``None``.
 
-    ``0`` is accepted and means "let the operating system assign an ephemeral
-    port", which is how a test binds a listener without any risk of colliding
-    with a server already running on 8000.
+    ``0`` is accepted **here** and means "let the operating system assign an
+    ephemeral port", which is how a test binds a listener without any risk of
+    colliding with a server already running on 8000.  That is a bind-time
+    argument, and it is the one place ``0`` is legal: a *configured* ``0`` is
+    rejected by ``health.py``'s resolution at every tier, because an endpoint on a
+    port the kernel picked cannot be reached by a probe configured in advance.
 
     ``bool`` is rejected explicitly, ahead of the ``int`` check it would
     otherwise satisfy as a subclass: ``True`` is a configuration mistake, not a
@@ -278,6 +292,27 @@ def _sanitize_host(host):
     if any(character not in _HOST_SAFE_CHARACTERS for character in host):
         return UNSAFE_HOST_TEXT
     return host
+
+
+def _bounded_configured_value(value):
+    """Return *value* as text no longer than :data:`_MAX_CONFIGURED_LENGTH`.
+
+    Used for the value quoted in a frozen-value warning, which is the one piece
+    of document-supplied text this module renders in full rather than replacing.
+    It is rendered because it is the actionable half of the message -- an
+    operator needs to recognise the value in ``config/health.json`` -- and it is
+    bounded because a document can declare a value of any length and the error
+    stream should not carry it.  Control characters are removed downstream by
+    :func:`_printable`, so a value cut here can still never forge a second line.
+
+    :param value: the rejected value, of any type.
+    :returns: the value as text, truncated with :data:`_TRUNCATION_MARK` when it
+        exceeded the bound.
+    """
+    text = value if isinstance(value, str) else str(value)
+    if len(text) <= _MAX_CONFIGURED_LENGTH:
+        return text
+    return f"{text[:_MAX_CONFIGURED_LENGTH]}{_TRUNCATION_MARK}"
 
 
 def _format_authority(host, port):
@@ -783,18 +818,25 @@ def _report_bind_failure(host, port, error):
 def report_frozen_value_conflicts():
     """Report, once at start-up, every configured value rejected as frozen.
 
-    The resource path and the ``status`` literal are contract constants, so
-    ``health.py`` serves them whatever ``config/health.json`` says.  Serving the
-    right thing is not by itself enough: a deployment that edited that document
-    expecting an effect would otherwise get silence, and would discover the truth
-    only from a monitoring gap.  One line per rejected value names the key, what
-    was configured, and what is served instead.
+    The resource path and the ``status`` literal are read from
+    ``config/health.json`` but validated against the contract before they are
+    adopted, so ``health.py`` serves the contract's literal whatever that document
+    says.  Serving the right thing is not by itself enough: a deployment that
+    edited the document expecting an effect would otherwise get silence, and
+    would discover the truth only from a monitoring gap.  One line per rejected
+    value names the key, what was configured, and what is served instead.
 
     Standard error, because this reports a misconfiguration rather than normal
     progress -- and emitted here rather than in ``health.py`` because that module
     must stay importable without writing to either stream.  A correctly configured
-    deployment prints nothing at all, which is why this cannot add noise to a CI
-    log.
+    deployment prints nothing at all, so this can add no noise to an ordinary
+    start-up.
+
+    The rejected value passes through :func:`_bounded_configured_value` first, so
+    a document declaring an enormous value cannot put its whole length on the
+    error stream, and through :func:`_printable` in :func:`_write_stderr`, so it
+    cannot forge a second log line.  The line count is bounded by construction:
+    there are two frozen keys, so there can never be more than two of these.
 
     :returns: the number of conflicts reported, so a caller (or a test) can
         assert on the count without parsing standard error.
@@ -803,7 +845,8 @@ def report_frozen_value_conflicts():
     document = f"{health.CONFIG_PATH.parent.name}/{health.CONFIG_PATH.name}"
     _write_stderr(
         [
-            f'ignoring configured {key} "{configured}": {key} is frozen at '
+            f'ignoring configured {key} '
+            f'"{_bounded_configured_value(configured)}": {key} is frozen at '
             f'"{frozen}" by the /health contract and is not a deployment '
             f'setting. Remove the value or restore it to "{frozen}" in '
             f"{document}."
@@ -869,8 +912,8 @@ def main():
         _write_stderr([degraded])
 
     # Then report anything the deployment declared that this tier refused to
-    # adopt because it would have redefined a frozen contract constant.  A
-    # correctly configured deployment prints nothing here either.
+    # adopt because it was not the contract's own literal.  A correctly
+    # configured deployment prints nothing here either.
     report_frozen_value_conflicts()
 
     host, port = resolve_bind_address()

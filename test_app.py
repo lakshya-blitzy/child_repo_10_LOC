@@ -1,6 +1,6 @@
 """Standard-library ``unittest`` suite for the Level 2 (``child_repo_10_LOC``) tier.
 
-Two things are asserted, and they carry equal weight.
+Five things are asserted, and they carry equal weight.
 
 1. **Preserved behaviour.**  ``greet("Lakshya")`` must still return
    ``"Hello Lakshya"``, and executing the ``app`` module under any name other
@@ -13,7 +13,8 @@ Two things are asserted, and they carry equal weight.
    network is asserted against :func:`health.build_payload` directly -- which is
    exactly why ``health.py`` keeps the payload builder separate from the
    listener -- and every clause that genuinely needs the wire is asserted
-   against a real listener bound to an **ephemeral loopback port**.
+   against a real listener bound to an **ephemeral loopback port**.  The
+   contract is reproduced in full below.
 3. **The configuration precedence chain, behaviourally.**  ``HEALTH_HOST`` and
    ``HEALTH_PORT`` are not merely named here; a copy of ``health.py`` is executed
    under controlled environment values, from a directory whose configuration
@@ -22,9 +23,11 @@ Two things are asserted, and they carry equal weight.
    both directions: a usable override wins, and an unusable one falls through.
 4. **The process entry point.**  ``server.py`` -- the program a deployment
    actually runs -- is exercised twice over: its pure helpers and its
-   listener in this process, and the whole program as a real child process with
-   ``HEALTH_PORT=0``, probed over HTTP, stopped with ``SIGTERM`` and ``SIGINT``,
-   and failed deliberately against an occupied port to assert its diagnostic.
+   listener in this process, and the whole program as a real child process on a
+   port this suite reserves and releases first (see
+   :func:`_reserve_free_port`), probed over HTTP, stopped with ``SIGTERM`` and
+   ``SIGINT``, and failed deliberately against an occupied port to assert its
+   diagnostic.
 5. **Request framing and parser safety.**  A rejected request that carries a body,
    a chunked body, an unparseable or oversized ``Content-Length``, a truncated
    body, a malformed request line and an over-long target are all sent as raw
@@ -33,11 +36,7 @@ Two things are asserted, and they carry equal weight.
    reflect any request bytes back, and must not desynchronize a persistent
    connection.
 
-**The frozen health contract**: every clause that can be asserted without a
-network is asserted against :func:`health.build_payload` directly -- which is
-why ``health.py`` keeps the payload builder separate from the listener -- and
-every clause that genuinely needs the wire is asserted against a real listener
-bound to an **ephemeral loopback port**::
+The contract, spelled out as the request/response matrix this suite asserts::
 
     GET|HEAD /health      -> 200, four-member body, in this order:
                              name, version, timestamp, status
@@ -62,12 +61,16 @@ Two clauses of that contract are asserted here in more depth than a single
 example can express, because each is a place where a plausible implementation
 silently drifts:
 
-* **``status`` is a compiled-in protocol constant, never a configuration
-  input.**  It reports what the process observed about itself; a value read from
-  a file would report what somebody typed.  So the assertions run in the
-  direction ``configuration file must equal the constant``, never the reverse,
-  and one test tampers with an isolated copy of ``config/health.json`` -- making
-  it declare ``"DOWN"`` -- and requires the payload to keep reporting ``UP``.
+* **``status`` is a validated setting, not a trusted one.**  ``config/health.json``
+  is its declared source and the declaration really is read -- so the assertions
+  prove the chain is live, not decorative -- but it is adopted only when it is
+  exactly ``"UP"``.  Anything else is refused, the compiled-in literal is served
+  instead, the provenance published through :func:`health.get_config_sources`
+  says ``fallback``, and the refusal is listed by
+  :func:`health.frozen_value_conflicts`.  Both directions are therefore
+  asserted: a declaration that restates the literal is adopted and reported as
+  ``file``, while a tampered isolated copy declaring ``"DOWN"`` cannot move the
+  reported status off ``UP``.  ``path`` is resolved the same way.
 * **Exactly one spelling of the target is served.**  Nothing is percent-decoded,
   no run of slashes is collapsed and no dot segment is resolved, so every alias
   a URI parser might otherwise fold onto ``/health`` is a ``404``.  The rule is
@@ -75,7 +78,7 @@ silently drifts:
   the wire against a real listener for every spelling in
   :data:`UNSERVED_TARGETS`.
 
-Three deliberate design decisions in this file are worth stating up front,
+Four deliberate design decisions in this file are worth stating up front,
 because each one is load-bearing:
 
 * **Expected values are spelled out as literals here, independently of
@@ -85,11 +88,13 @@ because each one is load-bearing:
   agreement between two independent sources, never deriving the expectation
   from the code under test.
 * **No listener ever binds port 8000.**  8000 is the tier's declared serving
-  port, so a real server may be listening on it.  Every
-  listener here binds ``("127.0.0.1", 0)`` and reads the assigned port back --
-  including the ``server.py`` child processes, which are given
-  ``HEALTH_HOST=127.0.0.1`` and ``HEALTH_PORT=0`` -- so this suite passes whether
-  or not the real server is running, and never exposes a socket beyond loopback.
+  port, so a real server may be listening on it.  Every listener inside this
+  process binds ``("127.0.0.1", 0)`` and reads the assigned port back; every
+  ``server.py`` child process is given ``HEALTH_HOST=127.0.0.1`` and a port
+  :func:`_reserve_free_port` has just reserved and released, because ``0`` is not
+  a usable *configured* value -- ``health.py`` refuses it and would fall through
+  to 8000.  Either way this suite passes whether or not the real server is
+  running, and never exposes a socket beyond loopback.
 * **Every wait is bounded and nothing is left behind.**  Readiness is established
   by polling, never by sleeping; every socket carries a timeout; every child
   process is signalled, awaited under a deadline and killed unconditionally in a
@@ -189,13 +194,14 @@ EXPECTED_BIND_HOST = "0.0.0.0"
 TIER_PORT = 8000
 
 #: A serving document that tries to move the endpoint and invert the status it
-#: reports.  ``path`` and ``status`` are frozen contract constants, so both of
-#: these declarations must be rejected; ``host`` and ``port`` are ordinary
-#: deployment settings, so both of *those* must be honoured.  Carrying all four in
-#: one document is what makes the rejection provable: a test that only asserted
-#: the two rejections could pass against an implementation that ignored the file
-#: entirely, whereas asserting the two acceptances in the same breath proves the
-#: document was read and only the frozen keys were refused.
+#: reports.  ``path`` and ``status`` are validated against the contract literals
+#: rather than trusted, so neither of these declarations can be adopted; ``host``
+#: and ``port`` are ordinary deployment settings, so both of *those* must be
+#: honoured.  Carrying all four in one document is what makes the refusal
+#: provable: a test that only asserted the two refusals could pass against an
+#: implementation that ignored the file entirely, whereas asserting the two
+#: acceptances in the same breath proves the document was read and only the
+#: illegal values were refused.
 HOSTILE_SERVING_DOCUMENT = {
     "host": "127.0.0.1",
     "port": 8123,
@@ -372,8 +378,8 @@ REFUSED_METHODS = (
 UNRECOGNISED_METHOD_TOKENS = ("FROBNICATE", "get")
 
 #: The value a tampered configuration file declares.  It must never reach the
-#: wire: ``status`` is a protocol constant, so a configuration file cannot
-#: publish ``DOWN`` from a healthy process.
+#: wire: a declared ``status`` is validated against the contract literal, so no
+#: configuration file can publish ``DOWN`` from a healthy process.
 TAMPERED_STATUS = "DOWN"
 
 #: Serving parameters written into an isolated workspace alongside the tampered
@@ -383,8 +389,17 @@ TAMPERED_HOST = "127.0.0.1"
 TAMPERED_PORT = 18765
 TAMPERED_PATH = "/healthcheck"
 
-#: Loopback only, and port 0 so the operating system assigns a free port.
+#: Loopback only: a test must never publish a socket on another interface.
 LOOPBACK_HOST = "127.0.0.1"
+
+#: The operating system's "assign me any free port" sentinel.
+#:
+#: Usable only where *this suite* binds the listener, by passing it straight to a
+#: server constructor.  It is not usable as a configured value: a resolved
+#: configuration port of ``0`` is rejected at every tier, because an endpoint on a
+#: port the kernel chose cannot be reached by anything configured in advance.
+#: Anything that has to reach a *child process*'s listener therefore reserves a
+#: concrete number with :func:`_reserve_free_port`.
 EPHEMERAL_PORT = 0
 
 #: Poll interval, margin and hard ceiling used by the wall-clock tracking
@@ -462,9 +477,9 @@ _HEALTH_HOSTILE_MODULE_NAME = "blitzy_probe_health_hostile_config"
 
 #: Sentinel asking the degraded-configuration fixture to create a *directory*
 #: where a configuration file belongs.  That is how an unopenable source is
-#: simulated: revoking read permission is unreliable because CI commonly runs as
-#: root, for whom the mode bits do not apply, whereas a directory refuses to be
-#: read as a file for every user alike.
+#: simulated: revoking read permission is unreliable because an automated
+#: environment commonly runs as root, for whom the mode bits do not apply,
+#: whereas a directory refuses to be read as a file for every user alike.
 _AS_DIRECTORY = object()
 
 #: Serving values written into the *isolated* configuration used by the
@@ -618,7 +633,7 @@ def _await_port_release(host, port):
 
     Asserting that a listener was *released* rather than merely silenced is what
     proves a shutdown was orderly: a port left bound by a half-stopped process is
-    exactly what makes the next pipeline run fail with a puzzling
+    exactly what makes the next start-up fail with a puzzling
     "address already in use".  Polling keeps the check both prompt and bounded.
     """
     deadline = time.monotonic() + PORT_RELEASE_TIMEOUT_SECONDS
@@ -782,7 +797,7 @@ class _ServerProcess:
 
     Three safety properties are built in rather than left to each caller.  Output
     is drained by a reader thread per stream, so a child can never block writing to
-    a full pipe while the test waits for it -- a deadlock that would hang CI.
+    a full pipe while the test waits for it -- a deadlock that would hang the run.
     Every wait has a deadline and reports what the child printed when it expires,
     so a defect surfaces as a legible failure rather than a hang.  And
     :meth:`stop` escalates to ``SIGKILL`` and is idempotent, so it can be
@@ -810,7 +825,9 @@ class _ServerProcess:
         program = pathlib.Path(server.__file__).resolve()
         self._stdout_lines = []
         self._stderr_lines = []
-        self._process = subprocess.Popen(  # noqa: S603 - fixed argv, no shell
+        # The argv is a fixed list and ``shell`` is left at its default of
+        # False, so nothing here is interpreted by a shell.
+        self._process = subprocess.Popen(
             [sys.executable, program.name, *arguments],
             cwd=str(program.parent),
             env=_child_environment(**environment_overrides),
@@ -948,7 +965,7 @@ class _Response:
     value object instead.
     """
 
-    #: Sorted, as the linters prefer; the constructor keeps wire order instead.
+    #: Named in alphabetical order; the constructor keeps wire order instead.
     __slots__ = ("body", "headers", "status")
 
     def __init__(self, status, headers, body):
@@ -988,6 +1005,23 @@ def _patched_attribute(target, name, value):
         yield
     finally:
         setattr(target, name, original)
+
+
+def _reserve_free_port():
+    """Reserve a concrete free loopback port number and release it again.
+
+    A configured port of ``0`` is rejected at every tier, so a test that needs a
+    *child process* to bind a listener it can then reach must supply a real number.
+    Asking the operating system for one and handing it straight back is how that
+    number is obtained without hardcoding a guess that could collide with
+    something already running on the host.
+
+    The socket is closed before the number is returned, so the caller receives a
+    port that is free rather than one this process is holding.
+    """
+    with socket.socket(socket.AF_INET, socket.SOCK_STREAM) as probe:
+        probe.bind((LOOPBACK_HOST, EPHEMERAL_PORT))
+        return probe.getsockname()[1]
 
 
 @contextlib.contextmanager
@@ -1350,20 +1384,45 @@ class TestFrozenContractConstants(unittest.TestCase):
     def test_get_config_returns_an_independent_snapshot(self):
         """Each call returns a fresh mapping, so a caller cannot mutate the module.
 
-        The key set is asserted exactly, and ``status`` is asserted absent by
-        name: this mapping is the resolved *configuration*, and the reported
-        status is not configuration.  Its presence here would invite a caller to
-        treat it as an adjustable value.
+        The key set is asserted exactly.  Every value the endpoint serves is in it,
+        ``status`` included: each one traces to a declared source rather than to a
+        literal written inline at its point of use, and the two validated values
+        are still unmovable because their declaration is checked against the
+        contract before it is adopted.
         """
         first = health.get_config()
         second = health.get_config()
-        self.assertEqual(sorted(first), ["host", "name", "path", "port", "version"])
-        self.assertNotIn("status", first)
+        self.assertEqual(
+            sorted(first), ["host", "name", "path", "port", "status", "version"]
+        )
+        self.assertEqual(first["status"], EXPECTED_STATUS)
         self.assertEqual(first, second)
         self.assertIsNot(first, second)
         first["name"] = "mutated"
+        first["status"] = "DOWN"
         self.assertEqual(health.get_config()["name"], EXPECTED_NAME)
+        self.assertEqual(health.get_config()["status"], EXPECTED_STATUS)
         self.assertEqual(health.APP_NAME, EXPECTED_NAME)
+        self.assertEqual(health.HEALTH_STATUS, EXPECTED_STATUS)
+
+    def test_get_config_sources_returns_an_independent_snapshot(self):
+        """The provenance map is copied per call and keyed exactly as the config.
+
+        A caller must not be able to rewrite the module's own record of where its
+        values came from -- that record is the only thing that distinguishes an
+        adopted declaration from a refused one when both yield the same value.
+        """
+        first = health.get_config_sources()
+        second = health.get_config_sources()
+        self.assertEqual(sorted(first), sorted(health.get_config()))
+        self.assertEqual(first, second)
+        self.assertIsNot(first, second)
+        self.assertLessEqual(
+            set(first.values()),
+            {health.FROM_ENVIRONMENT, health.FROM_FILE, health.FROM_FALLBACK},
+        )
+        first["status"] = "spoofed"
+        self.assertEqual(health.get_config_sources()["status"], health.FROM_FILE)
 
     def test_handler_aliases_resolve_to_one_class(self):
         """All three exported spellings are the same handler class.
@@ -1429,14 +1488,15 @@ class TestDeclaredConfigurationSources(unittest.TestCase):
         self.assertEqual(document["host"], EXPECTED_BIND_HOST)
         self.assertEqual(document["port"], TIER_PORT)
         self.assertEqual(document["path"], EXPECTED_PATH)
-        # The declared shape includes ``status``, and the declaration must agree
-        # with the literal -- but it is asserted against ``EXPECTED_STATUS``, not
-        # used to derive an expectation, because the module does not read it.
+        # The declared shape includes ``status``.  It is asserted against
+        # ``EXPECTED_STATUS`` -- the literal spelled independently in this file --
+        # rather than used to derive an expectation, so a document that drifted
+        # would fail here instead of moving the expectation with it.
         self.assertEqual(document["status"], EXPECTED_STATUS)
-        # The path and the status are frozen contract constants, not settings this
-        # document supplies: the endpoint serves ``/health`` and reports ``UP``
-        # whatever the file says (proved by
-        # :class:`TestFrozenValuesResistReconfiguration`).  The document restates
+        # ``path`` and ``status`` are read from this document and then validated
+        # against the contract literals, so the endpoint serves ``/health`` and
+        # reports ``UP`` whatever the file says (proved by
+        # :class:`TestFrozenValuesResistReconfiguration`).  The document declares
         # both on purpose, so that an operator reading this one file sees the whole
         # shape of what is served -- which is why the resolved values and the
         # declared ones agree here, and why that agreement must produce no
@@ -1445,23 +1505,28 @@ class TestDeclaredConfigurationSources(unittest.TestCase):
         self.assertEqual(health.STATUS_UP, document["status"])
         self.assertEqual(health.frozen_value_conflicts(), ())
 
-    def test_the_declared_status_member_is_pinned_to_the_protocol_constant(self):
-        """The document's ``status`` is a declaration, and it is pinned, not read.
+    def test_the_declared_status_member_is_read_and_validated(self):
+        """The document's ``status`` is read, and adopted only because it is legal.
 
-        ``config/health.json`` still declares the literal, because the contract
-        document is normative for all three tiers and the declaration keeps the
-        file a complete description of the endpoint.  The assertion therefore
-        runs in one direction only -- *the file must agree with the constant* --
-        and never the reverse, because the reverse is exactly the defect this
-        test exists to prevent: a payload whose status is whatever a
-        configuration file happens to say.  The proof that the value is not read
-        is that it is absent from :func:`health.get_config`, which is the whole
-        of what resolution produces.
+        ``config/health.json`` declares the literal, because the contract document
+        is normative for all three tiers and the declaration keeps the file a
+        complete description of the endpoint.  The assertion runs in one direction
+        only -- *the file must agree with the constant* -- and never the reverse,
+        because the reverse is the defect this test exists to prevent: a payload
+        whose status is whatever a configuration file happens to say.
+
+        That the declaration is genuinely *read* rather than decorative is proved
+        by the provenance: with this document present, ``status`` resolves from the
+        file and no conflict is recorded.  The companion cases in
+        :class:`TestStatusIsNotConfigurable` prove the other direction, that an
+        illegal declaration resolves to the fallback and is reported.
         """
         document = json.loads(health.CONFIG_PATH.read_text(encoding=EXPECTED_ENCODING))
         self.assertEqual(document["status"], health.STATUS_UP)
         self.assertEqual(document["status"], EXPECTED_STATUS)
-        self.assertNotIn("status", health.get_config())
+        self.assertEqual(health.get_config()["status"], EXPECTED_STATUS)
+        self.assertEqual(health.get_config_sources()["status"], health.FROM_FILE)
+        self.assertEqual(health.frozen_value_conflicts(), ())
 
     def test_sources_are_resolved_from_the_module_location_not_the_cwd(self):
         """Both declared sources sit beside the module that reads them.
@@ -1482,8 +1547,8 @@ class TestDeclaredConfigurationSources(unittest.TestCase):
 
         ``name`` and ``version`` are traced to ``pyproject.toml`` -- they are
         configuration and must not be spelled inline.  ``status`` is traced to
-        the protocol constant instead, which is the one member that must *not*
-        follow a configuration file.
+        ``STATUS_UP``, the contract literal a declaration is validated against:
+        the declared source may restate it but can never replace it.
         """
         with health.PYPROJECT_PATH.open("rb") as handle:
             project = tomllib.load(handle)["project"]
@@ -1537,8 +1602,8 @@ class TestHealthPayload(PayloadContractAssertions, unittest.TestCase):
         """``status`` is the literal ``UP`` -- uppercase, exactly two characters.
 
         Compared against both the independent literal spelled in this file and
-        the module's protocol constant, so the payload, the constant and the
-        contract are pinned to one another in a single assertion.
+        the module's own ``STATUS_UP``, so the payload, the contract literal and
+        the contract text are pinned to one another in a single assertion.
         """
         self.assertEqual(health.build_payload()["status"], EXPECTED_STATUS)
         self.assertEqual(health.build_payload()["status"], health.STATUS_UP)
@@ -1578,7 +1643,7 @@ class TestHealthPayload(PayloadContractAssertions, unittest.TestCase):
         instead of waiting for the clock to land on one.  That case is exactly
         where a naive formatter fails -- it omits the fractional part entirely --
         so a single-shot check against the live clock passes almost always and
-        then fails in a pipeline.
+        then fails once, unreproducibly, on the run that happens to land there.
         """
         for millis in CRAFTED_INSTANTS_MS:
             with self.subTest(millis=millis):
@@ -1929,12 +1994,14 @@ class TestHealthPayloadFallbackResilience(PayloadContractAssertions, unittest.Te
         """``name``, ``version`` and ``path`` come from the literals.
 
         The identity pair has no environment override, so with ``pyproject.toml``
-        absent both values are provably the compiled-in fallbacks.  The path and
-        the status are stronger still: they are frozen constants with no
-        resolution chain at all, so they are the literals whether the files are
-        present, absent or hostile.  ``HOST`` and ``PORT`` are excluded on
-        purpose: both accept an override, so asserting them by value here would
-        make the test depend on the environment it happens to run in.
+        absent both values are provably the compiled-in fallbacks.  ``path`` and
+        ``status`` reach the same place by a different route: their declared source
+        is absent here, so resolution falls through to the literals -- and because
+        the only declaration that could ever be adopted *is* the literal, they are
+        those values whether the file is present, absent or hostile.  ``HOST`` and
+        ``PORT`` are excluded on purpose: both accept an override, so asserting
+        them by value here would make the test depend on the environment it
+        happens to run in.
         """
         module = self._load_isolated_module()
         self.assertEqual(module.APP_NAME, module.FALLBACK_NAME)
@@ -1947,14 +2014,19 @@ class TestHealthPayloadFallbackResilience(PayloadContractAssertions, unittest.Te
     def test_status_needs_no_configuration_to_be_reported(self):
         """With every configuration file absent, ``status`` is still ``UP``.
 
-        The status member is the one value that cannot degrade, because it is
-        not resolved from anything: with no identity source and no serving
-        source, the payload still reports the protocol constant.
+        The status member is the one value whose degradation is invisible on the
+        wire: with no identity source and no serving source, its chain reaches the
+        compiled-in literal and the payload reports exactly what it always
+        reports.  The provenance is what makes the degradation observable at all.
         """
         module = self._load_isolated_module()
         self.assertEqual(module.STATUS_UP, EXPECTED_STATUS)
         self.assertEqual(module.build_payload()["status"], EXPECTED_STATUS)
-        self.assertNotIn("status", module.get_config())
+        self.assertEqual(module.get_config()["status"], EXPECTED_STATUS)
+        self.assertEqual(module.get_config_sources()["status"], module.FROM_FALLBACK)
+        # Nothing was declared, so nothing was rejected: an absent source is a
+        # degradation, not a conflict.
+        self.assertEqual(module.frozen_value_conflicts(), ())
 
     def test_a_configuration_file_cannot_change_the_reported_status(self):
         """A file declaring ``"DOWN"`` is honoured for serving, ignored for status.
@@ -1966,11 +2038,11 @@ class TestHealthPayloadFallbackResilience(PayloadContractAssertions, unittest.Te
         what proves the document really was read, so the test cannot pass
         vacuously -- while the payload must go on reporting ``UP``.
 
-        A configurable status would let a deployment publish ``DOWN`` from a
+        A freely configurable status would let a deployment publish ``DOWN`` from a
         perfectly healthy process, and would let two tiers of one composition
         disagree about the vocabulary itself.  Every consumer of this contract --
-        an orchestrator's liveness poller, the container ``HEALTHCHECK``, the CI
-        probe -- would then be reading a claim rather than a measurement.
+        an orchestrator's liveness poller, any fixed-interval probe -- would then
+        be reading a claim rather than a measurement.
         """
         module = self._load_isolated_module(
             serving_document={
@@ -1987,22 +2059,32 @@ class TestHealthPayloadFallbackResilience(PayloadContractAssertions, unittest.Te
         self.assertEqual(module.PORT, TAMPERED_PORT)
         self.assertNotEqual(TAMPERED_HOST, module.FALLBACK_HOST)
         self.assertNotEqual(TAMPERED_PORT, module.FALLBACK_PORT)
-        # The path in it was refused: the served path is a frozen contract
-        # constant, so the endpoint stays where every probe expects it, and the
-        # rejected declaration is named in the audit rather than silently
-        # dropped.
+        # The path in it was refused: the declared value is validated against the
+        # contract before it is adopted, so the endpoint stays where every probe
+        # expects it, the resolved value falls back to the literal, and the
+        # rejected declaration is named in the audit rather than silently dropped.
         self.assertEqual(module.HEALTH_PATH, module.FALLBACK_PATH)
         self.assertNotEqual(module.HEALTH_PATH, TAMPERED_PATH)
+        self.assertEqual(module.get_config_sources()["path"], module.FROM_FALLBACK)
         self.assertIn(
             ("path", TAMPERED_PATH, module.FALLBACK_PATH),
             module.frozen_value_conflicts(),
         )
-        # The status in it was not adopted, and could not have been.
+        # The status in it was refused the same way, and reported the same way.
         payload = module.build_payload()
         self.assertEqual(payload["status"], EXPECTED_STATUS)
         self.assertNotEqual(payload["status"], TAMPERED_STATUS)
         self.assertEqual(module.STATUS_UP, EXPECTED_STATUS)
-        self.assertNotIn("status", module.get_config())
+        self.assertEqual(module.get_config()["status"], EXPECTED_STATUS)
+        self.assertEqual(module.get_config_sources()["status"], module.FROM_FALLBACK)
+        self.assertIn(
+            ("status", TAMPERED_STATUS, module.STATUS_UP),
+            module.frozen_value_conflicts(),
+        )
+        # The two legitimate members of the same document were still adopted, so
+        # one refusal does not reject the whole file.
+        self.assertEqual(module.get_config_sources()["host"], module.FROM_FILE)
+        self.assertEqual(module.get_config_sources()["port"], module.FROM_FILE)
         # And the rest of the contract is unaffected by the tampering.
         self.assert_payload_conforms(payload)
         self.assert_byte_shape(module.serialize(payload).decode(EXPECTED_ENCODING))
@@ -2025,16 +2107,19 @@ class TestStatusIsNotConfigurable(PayloadContractAssertions, unittest.TestCase):
 
     This is a safety property, not a convenience.  The endpoint reports process
     liveness only and performs no dependency checks, so a settable status would
-    let a deployment -- or a stray edit to a container image -- declare a process
-    healthy that is not, or unhealthy that is.  The word on the wire has to mean
-    "this process answered", and it can only mean that if nothing outside
-    ``health.py`` is able to choose it.
+    let whoever edits a deployment's configuration declare a process healthy that
+    is not, or unhealthy that is.  The word on the wire has to mean "this process
+    answered", and it can only mean that if the declared source is validated
+    rather than trusted: ``config/health.json`` is read, but the only value it
+    can get adopted is the contract literal itself.
 
     Asserting the resolved value equals ``UP`` cannot prove this on its own: it
     passes just as happily for an implementation that reads ``status`` out of a
     file that happens to declare ``UP``.  The only assertion that distinguishes
     the two is a file declaring something *else*, so that is what this class
-    builds.
+    builds -- and the companion assertion that a declaration restating the
+    literal is adopted, with provenance ``file``, is what proves the chain is
+    live rather than decorative.
 
     The same discipline as the fallback class applies, for the same reason: the
     mutated document is written into a private temporary directory beside a copy
@@ -2109,22 +2194,47 @@ class TestStatusIsNotConfigurable(PayloadContractAssertions, unittest.TestCase):
         self.assertEqual(module.declared_status(written), declared)
         return module
 
-    def test_a_declared_status_is_read_but_never_reported(self):
-        """The document declares ``DOWN``; the endpoint still reports ``UP``."""
+    def test_a_declared_status_is_read_but_refused_when_it_is_not_the_literal(self):
+        """The document declares ``DOWN``; the endpoint still reports ``UP``.
+
+        The refusal is asserted three ways -- the served value, the provenance and
+        the audit trail -- because the served value alone would also hold for an
+        implementation that never read the file at all.
+        """
         module = self._load_with_declared_status(self.HOSTILE_STATUS)
         self.assertEqual(module.STATUS_UP, EXPECTED_STATUS)
         self.assertEqual(module.build_payload()["status"], EXPECTED_STATUS)
-        # There is no ``FALLBACK_STATUS`` and no resolved ``status`` member: a
-        # constant needs no fallback, and a value that is never resolved has no
-        # place in the resolved configuration.
-        self.assertFalse(hasattr(module, "FALLBACK_STATUS"))
-        self.assertNotIn("status", module.get_config())
+        self.assertEqual(module.get_config()["status"], EXPECTED_STATUS)
+        self.assertEqual(module.get_config_sources()["status"], module.FROM_FALLBACK)
+        self.assertIn(
+            ("status", self.HOSTILE_STATUS, module.STATUS_UP),
+            module.frozen_value_conflicts(),
+        )
 
     def test_an_arbitrary_declared_status_is_equally_powerless(self):
-        """Any declared value is ignored, not just a recognised one."""
+        """Any illegal declared value is refused, not just a recognised one."""
         module = self._load_with_declared_status(self.ARBITRARY_STATUS)
         self.assertEqual(module.STATUS_UP, EXPECTED_STATUS)
         self.assertEqual(module.build_payload()["status"], EXPECTED_STATUS)
+        self.assertEqual(module.get_config_sources()["status"], module.FROM_FALLBACK)
+        self.assertIn(
+            ("status", self.ARBITRARY_STATUS, module.STATUS_UP),
+            module.frozen_value_conflicts(),
+        )
+
+    def test_a_declaration_that_restates_the_literal_is_adopted(self):
+        """The other direction: a legal declaration is taken *from the file*.
+
+        This is the assertion that proves the chain is live rather than
+        decorative.  Without it, every refusal case above would pass just as
+        happily for an implementation that had stopped reading the declaration
+        altogether -- which is precisely a dead configuration key.
+        """
+        module = self._load_with_declared_status(EXPECTED_STATUS)
+        self.assertEqual(module.get_config()["status"], EXPECTED_STATUS)
+        self.assertEqual(module.build_payload()["status"], EXPECTED_STATUS)
+        self.assertEqual(module.get_config_sources()["status"], module.FROM_FILE)
+        self.assertEqual(module.frozen_value_conflicts(), ())
 
     def test_the_serialized_body_is_unchanged_by_a_declared_status(self):
         """The bytes on the wire are unaffected, suffix and shape included."""
@@ -2136,30 +2246,35 @@ class TestStatusIsNotConfigurable(PayloadContractAssertions, unittest.TestCase):
         self.assertNotIn(self.HOSTILE_STATUS, rendered)
 
     def test_the_other_serving_values_are_still_read_from_the_document(self):
-        """Only the status is exempt: the rest of the chain is untouched.
+        """Only the refused status is affected: the rest of the chain still reads.
 
         Without this, a fix that stopped reading the file altogether would look
-        indistinguishable from a fix that stopped reading only the status.
+        indistinguishable from a fix that refused only the hostile status.  The
+        document's ``path`` is the contract literal, so it passes validation and
+        is adopted -- which is exactly what makes it a usable positive control.
         """
         module = self._load_with_declared_status(self.HOSTILE_STATUS)
         document = json.loads(self._serving_bytes.decode(EXPECTED_ENCODING))
         self.assertEqual(module.HEALTH_PATH, document["path"])
         self.assertEqual(module.APP_NAME, EXPECTED_NAME)
         self.assertEqual(module.APP_VERSION, EXPECTED_VERSION)
+
+
 class TestFrozenValuesResistReconfiguration(
     PayloadContractAssertions, unittest.TestCase
 ):
     """No configuration document can move the endpoint or change its status.
 
     ``/health`` and ``UP`` are clauses of the contract, not deployment settings.
-    Three tiers implement that contract independently, a container ``HEALTHCHECK``
-    and a CI probe both target the path literally, and the whole point of the
-    ``status`` member is that a caller can trust what it says -- so a file that
-    could redefine either value would be a way to make a process *report* health
-    it does not have, or to move the endpoint out from under every probe that
-    watches it.  The values are therefore frozen constants in ``health.py``, and
-    this class proves it by handing the module a document that tries to change
-    them.
+    Three tiers implement that contract independently, every probe that watches
+    the endpoint targets the path literally, and the whole point of the ``status``
+    member is that a caller can trust what it says -- so a file that could
+    redefine either value would be a way to make a process *report* health it does
+    not have, or to move the endpoint out from under every probe that watches it.
+    Both values are therefore *validated* on the way in rather than trusted: the
+    declaration is read, and it is adopted only when it restates the contract
+    literal exactly.  This class proves it by handing the module a document that
+    tries to change them.
 
     Two properties make the proof airtight rather than merely reassuring:
 
@@ -2254,18 +2369,26 @@ class TestFrozenValuesResistReconfiguration(
         """``path``/``status`` are refused while ``host``/``port`` are honoured.
 
         The two acceptances are the control: they prove this document was read,
-        which is what makes the two refusals meaningful.
+        which is what makes the two refusals meaningful.  The provenance is
+        asserted alongside every value, so a refusal is visibly a refusal rather
+        than a value that happens to look right.
         """
         module = self._load_with_serving_document(HOSTILE_SERVING_DOCUMENT)
-        # Refused: frozen contract values.
+        sources = module.get_config_sources()
+        # Refused: the declaration was not the contract's literal.
         self.assertEqual(module.HEALTH_PATH, EXPECTED_PATH)
+        self.assertEqual(module.HEALTH_STATUS, EXPECTED_STATUS)
         self.assertEqual(module.STATUS_UP, EXPECTED_STATUS)
         self.assertEqual(module.HealthRequestHandler.health_path, EXPECTED_PATH)
         self.assertNotEqual(module.HEALTH_PATH, HOSTILE_SERVING_DOCUMENT["path"])
-        self.assertNotEqual(module.STATUS_UP, HOSTILE_SERVING_DOCUMENT["status"])
+        self.assertNotEqual(module.HEALTH_STATUS, HOSTILE_SERVING_DOCUMENT["status"])
+        self.assertEqual(sources["path"], module.FROM_FALLBACK)
+        self.assertEqual(sources["status"], module.FROM_FALLBACK)
         # Honoured: ordinary deployment settings, from the same document.
         self.assertEqual(module.HOST, HOSTILE_SERVING_DOCUMENT["host"])
         self.assertEqual(module.PORT, HOSTILE_SERVING_DOCUMENT["port"])
+        self.assertEqual(sources["host"], module.FROM_FILE)
+        self.assertEqual(sources["port"], module.FROM_FILE)
 
     def test_the_payload_reports_up_however_the_document_declares_the_status(self):
         """The built payload still conforms, still says ``UP``, still byte-shapes."""
@@ -2275,7 +2398,8 @@ class TestFrozenValuesResistReconfiguration(
         self.assertEqual(payload["status"], EXPECTED_STATUS)
         self.assert_byte_shape(module.serialize(payload).decode(EXPECTED_ENCODING))
         self.assertEqual(module.get_config()["path"], EXPECTED_PATH)
-        self.assertNotIn("status", module.get_config())
+        self.assertEqual(module.get_config()["status"], EXPECTED_STATUS)
+        self.assertEqual(module.get_config_sources()["status"], module.FROM_FALLBACK)
         self.assertEqual(module.STATUS_UP, EXPECTED_STATUS)
 
     def test_over_http_the_frozen_path_serves_and_the_declared_one_does_not(self):
@@ -2441,7 +2565,7 @@ class TestFrozenConflictReporting(unittest.TestCase):
                 # The remedy has to name the file to edit, or the warning is a
                 # riddle: the reader learns something is wrong but not where.
                 self.assertIn(health.CONFIG_PATH.name, line)
-                # Attributable in an interleaved CI log.
+                # Attributable when several processes share one log.
                 self.assertTrue(line.startswith("server.py:"), line)
 
     def test_a_conflict_free_configuration_produces_no_output(self):
@@ -2449,6 +2573,48 @@ class TestFrozenConflictReporting(unittest.TestCase):
         count, lines = self._report(())
         self.assertEqual(count, 0)
         self.assertEqual(lines, [])
+
+    def test_an_enormous_declaration_is_rendered_within_a_bound(self):
+        """A rejected value is quoted, but never at unbounded length.
+
+        The value is document-supplied and a document may declare one of any
+        size, so rendering it whole would put that size on the error stream at
+        every start-up.  It is cut to a fixed bound and marked as cut, which
+        keeps the message actionable -- the leading characters are what an
+        operator recognises in the file -- without letting the log inherit the
+        document's length.
+        """
+        oversized = "D" * 4000
+        count, lines = self._report((("status", oversized, EXPECTED_STATUS),))
+        self.assertEqual(count, 1)
+        self.assertEqual(len(lines), 1)
+        line = lines[0]
+        self.assertNotIn(oversized, line)
+        self.assertIn(
+            "D" * entry_point._MAX_CONFIGURED_LENGTH + entry_point._TRUNCATION_MARK,
+            line,
+        )
+        # Bounded overall, not merely shorter than the input: the remedy prose is
+        # fixed, so the whole line is a fixed cost plus the bound.
+        self.assertLess(len(line), 400, line)
+
+    def test_a_hostile_declaration_cannot_forge_a_second_log_line(self):
+        """A newline in a rejected value stays inside one physical line.
+
+        The value reaches the log from ``config/health.json``, so a value
+        containing a line break would otherwise fabricate an additional entry --
+        including one impersonating the start-up announcement, in a log a human
+        or a parser later trusts.  Control characters are removed rather than
+        escaped, so one conflict is always exactly one line.
+        """
+        forged = "/nope\nserver.py: listening on http://evil/health"
+        count, lines = self._report((("path", forged, EXPECTED_PATH),))
+        self.assertEqual(count, 1)
+        self.assertEqual(len(lines), 1, lines)
+        self.assertNotIn("\n", lines[0])
+        self.assertNotIn("\r", lines[0])
+        # The readable remains of the value are still there to be recognised.
+        self.assertIn("/nope", lines[0])
 
     def test_the_shipped_configuration_is_reported_as_conflict_free(self):
         """The real, unmodified repository configuration warns about nothing.
@@ -2483,8 +2649,8 @@ class TestFrozenConflictReporting(unittest.TestCase):
 
         The whole reason this suite can import the entry point is that importing
         it defines functions and returns.  If that ever stopped being true, every
-        run of this file would bind port 8000 and CI would fail for a reason with
-        no connection to the code under test -- so it is asserted rather than
+        run of this file would bind port 8000 and the run would fail for a reason
+        with no connection to the code under test -- so it is asserted rather than
         trusted.
         """
         module_path = pathlib.Path(entry_point.__file__).resolve()
@@ -2586,12 +2752,16 @@ class TestCoercionPrimitives(unittest.TestCase):
         sentinel = object()
         for candidate, expected in (
             (8000, 8000),
-            (0, 0),
+            (1, 1),
             (65535, 65535),
             ("8000", 8000),
             ("  8199  ", 8199),
-            ("0", 0),
+            ("1", 1),
             ("65535", 65535),
+            # ``0`` asks the kernel to choose a port, which no configured value may
+            # do: see :data:`health._MIN_PORT`.
+            (0, sentinel),
+            ("0", sentinel),
             (-1, sentinel),
             (65536, sentinel),
             (70000, sentinel),
@@ -2623,12 +2793,21 @@ class TestCoercionPrimitives(unittest.TestCase):
         self.assertIs(health._coerce_port(True, sentinel), sentinel)
         self.assertIs(health._coerce_port(False, sentinel), sentinel)
 
-    def test_bounds_are_inclusive_and_permit_the_ephemeral_port(self):
-        """Port 0 is admitted deliberately: it is how a test binds without colliding."""
-        self.assertEqual(health._MIN_PORT, 0)
+    def test_bounds_are_inclusive_and_exclude_the_ephemeral_sentinel(self):
+        """Both bounds resolve; ``0`` is below the floor at every tier.
+
+        ``0`` asks the operating system to choose a port at random, so a
+        *configured* ``0`` would bind an address no probe configured in advance
+        could reach -- the endpoint running and unreachable at once.  All three
+        tiers reject it identically.  A test that wants an ephemeral port passes
+        ``0`` to the server constructor instead, which is a bind-time argument.
+        """
+        self.assertEqual(health._MIN_PORT, 1)
         self.assertEqual(health._MAX_PORT, 65535)
-        self.assertEqual(health._coerce_port(health._MIN_PORT, None), 0)
+        self.assertEqual(health._coerce_port(health._MIN_PORT, None), 1)
         self.assertEqual(health._coerce_port(health._MAX_PORT, None), 65535)
+        self.assertIsNone(health._coerce_port(0, None), "a configured 0 must not resolve")
+        self.assertIsNone(health._coerce_port("0", None))
 
 
 class TestBindOverridePrecedence(unittest.TestCase):
@@ -2691,7 +2870,15 @@ class TestBindOverridePrecedence(unittest.TestCase):
         )
 
     def _resolve(self, host_override, port_override, serving_document=None):
-        """Resolve the chain in an isolated copy and return its ``get_config()``.
+        """Resolve the chain in an isolated copy and return its ``get_config()``."""
+        return self._resolve_with_sources(
+            host_override, port_override, serving_document
+        )[0]
+
+    def _resolve_with_sources(
+        self, host_override, port_override, serving_document=None
+    ):
+        """Resolve the chain in an isolated copy; return ``(config, sources)``.
 
         *host_override* and *port_override* are applied to the environment for the
         duration of the module's execution only; ``None`` means the variable is
@@ -2712,7 +2899,7 @@ class TestBindOverridePrecedence(unittest.TestCase):
         self.assertEqual(stdout_text, "", "importing health.py must stay silent")
         self.assertEqual(stderr_text, "", "importing health.py must stay silent")
         self.assertEqual(module.MODULE_DIR, self._workspace)
-        return module.get_config()
+        return module.get_config(), module.get_config_sources()
 
     #: The workspace's configured serving document: distinguishable from both the
     #: overrides and the compiled-in literals.
@@ -2781,14 +2968,19 @@ class TestBindOverridePrecedence(unittest.TestCase):
                 )
                 self.assertNotEqual(config["port"], health.FALLBACK_PORT)
 
-    def test_the_ephemeral_port_is_a_usable_override(self):
-        """``HEALTH_PORT=0`` is honoured: it asks the operating system to choose.
+    def test_the_ephemeral_port_is_not_a_usable_configured_value(self):
+        """``HEALTH_PORT=0`` is rejected and falls through to the next link.
 
-        Rejecting it as "empty-ish" would break the one override a test or a
-        sidecar needs in order to bind without colliding with a running server.
+        ``0`` asks the operating system to choose a port, and a health endpoint on
+        a port chosen at bind time cannot be reached by anything configured in
+        advance -- the process would be running and unreachable at once.  All three
+        tiers reject it identically.  A test that wants an ephemeral listener passes
+        ``0`` to ``server.create_server``, which is a bind-time argument and not a
+        configured value.
         """
         config = self._resolve(None, "0", self._CONFIGURED)
-        self.assertEqual(config["port"], 0)
+        self.assertEqual(config["port"], ISOLATED_CONFIG_PORT)
+        self.assertNotEqual(config["port"], 0)
 
     def test_each_variable_is_resolved_independently(self):
         """Overriding the host does not disturb the port, and vice versa."""
@@ -2820,7 +3012,8 @@ class TestBindOverridePrecedence(unittest.TestCase):
         """Link three: an unusable override and no file, and the endpoint still serves.
 
         Both values resolve to the compiled-in literals, which is the property that
-        keeps a container with a missing configuration file able to report health.
+        keeps a deployment that did not ship the configuration file able to
+        report health.
         """
         config = self._resolve("   ", "not-a-port", None)
         self.assertEqual(config["host"], health.FALLBACK_HOST)
@@ -2868,16 +3061,22 @@ class TestBindOverridePrecedence(unittest.TestCase):
         self.assertEqual(config["version"], "9.9.9")
 
     def test_the_path_and_status_have_no_environment_override(self):
-        """The resource path and the status literal are contract, not configuration."""
+        """The resource path and the status literal have no environment layer.
+
+        Both are resolved settings, but their chain is ``config/health.json`` then
+        the compiled-in literal -- there is no variable to set, so inventing
+        plausible names for one changes nothing.  The workspace's document declares
+        both legally, so both resolve *from the file*, which is what proves the
+        chain is live rather than that the environment was merely ignored.
+        """
         with _environment(
             **{"HEALTH_PATH": "/spoofed", "HEALTH_STATUS": "DOWN", "PATH_OVERRIDE": "/x"}
         ):
-            config = self._resolve(None, None, self._CONFIGURED)
+            config, sources = self._resolve_with_sources(None, None, self._CONFIGURED)
         self.assertEqual(config["path"], EXPECTED_PATH)
-        # ``status`` is not a resolved setting at all: it is the compiled-in
-        # protocol constant, so it is absent from the resolved configuration and
-        # no environment variable can reach it.
-        self.assertNotIn("status", config)
+        self.assertEqual(config["status"], EXPECTED_STATUS)
+        self.assertEqual(sources["path"], health.FROM_FILE)
+        self.assertEqual(sources["status"], health.FROM_FILE)
         self.assertEqual(health.STATUS_UP, EXPECTED_STATUS)
 
     def test_a_relative_configured_path_is_rejected_for_the_literal(self):
@@ -2895,8 +3094,22 @@ class TestBindOverridePrecedence(unittest.TestCase):
         self.assertEqual(config["name"], EXPECTED_NAME)
         self.assertEqual(config["version"], EXPECTED_VERSION)
         self.assertEqual(config["path"], EXPECTED_PATH)
-        self.assertNotIn("status", config)
+        self.assertEqual(config["status"], EXPECTED_STATUS)
         self.assertEqual(health.STATUS_UP, EXPECTED_STATUS)
+        # The repository ships a document that declares every value legally, so
+        # nothing may report the fallback and nothing may be in conflict.
+        self.assertEqual(
+            health.get_config_sources(),
+            {
+                "name": health.FROM_FILE,
+                "version": health.FROM_FILE,
+                "host": health.FROM_FILE,
+                "port": health.FROM_FILE,
+                "path": health.FROM_FILE,
+                "status": health.FROM_FILE,
+            },
+        )
+        self.assertEqual(health.frozen_value_conflicts(), ())
 
 
 class TestResolverPrecedenceDirectly(unittest.TestCase):
@@ -2917,65 +3130,84 @@ class TestResolverPrecedenceDirectly(unittest.TestCase):
         self.assertEqual(dict(os.environ), self._environment_before)
 
     def test_host_precedence_matrix(self):
-        """Environment, then document, then literal -- for every combination."""
+        """Environment, then document, then literal -- value *and* provenance.
+
+        Each row asserts the pair the resolver returns, so the link that supplied
+        the value is pinned as well as the value itself.  Without the label, a row
+        whose expected value happens to equal the next link's value would pass for
+        a resolver that skipped a link entirely.
+        """
         document = {"host": ISOLATED_CONFIG_HOST}
         for override, expected in (
-            (OVERRIDE_HOST, OVERRIDE_HOST),
-            (f"  {OVERRIDE_HOST} ", OVERRIDE_HOST),
-            ("", ISOLATED_CONFIG_HOST),
-            ("   ", ISOLATED_CONFIG_HOST),
-            (None, ISOLATED_CONFIG_HOST),
+            (OVERRIDE_HOST, (OVERRIDE_HOST, health.FROM_ENVIRONMENT)),
+            (f"  {OVERRIDE_HOST} ", (OVERRIDE_HOST, health.FROM_ENVIRONMENT)),
+            ("", (ISOLATED_CONFIG_HOST, health.FROM_FILE)),
+            ("   ", (ISOLATED_CONFIG_HOST, health.FROM_FILE)),
+            (None, (ISOLATED_CONFIG_HOST, health.FROM_FILE)),
         ):
             with self.subTest(override=override):
                 with _environment(**{health.ENV_HOST: override}):
                     self.assertEqual(health._resolve_host(document), expected)
         for override, expected in (
-            (OVERRIDE_HOST, OVERRIDE_HOST),
-            ("", health.FALLBACK_HOST),
-            (None, health.FALLBACK_HOST),
+            (OVERRIDE_HOST, (OVERRIDE_HOST, health.FROM_ENVIRONMENT)),
+            ("", (health.FALLBACK_HOST, health.FROM_FALLBACK)),
+            (None, (health.FALLBACK_HOST, health.FROM_FALLBACK)),
         ):
             with self.subTest(override=override, document="empty"):
                 with _environment(**{health.ENV_HOST: override}):
                     self.assertEqual(health._resolve_host({}), expected)
 
     def test_port_precedence_matrix(self):
-        """An unusable override falls to the document, then the document to the literal."""
+        """An unusable override falls to the document, then the document to the literal.
+
+        ``0`` is among the unusable values, at both links: a configured port the
+        kernel chooses cannot be reached by a probe configured in advance, so it is
+        rejected identically at all three tiers.
+        """
         document = {"port": ISOLATED_CONFIG_PORT}
+        environment_wins = (OVERRIDE_PORT, health.FROM_ENVIRONMENT)
+        file_wins = (ISOLATED_CONFIG_PORT, health.FROM_FILE)
         for override, expected in (
-            (str(OVERRIDE_PORT), OVERRIDE_PORT),
-            (f" {OVERRIDE_PORT} ", OVERRIDE_PORT),
-            ("0", 0),
-            ("abc", ISOLATED_CONFIG_PORT),
-            ("70000", ISOLATED_CONFIG_PORT),
-            ("-1", ISOLATED_CONFIG_PORT),
-            ("True", ISOLATED_CONFIG_PORT),
-            ("", ISOLATED_CONFIG_PORT),
-            (None, ISOLATED_CONFIG_PORT),
+            (str(OVERRIDE_PORT), environment_wins),
+            (f" {OVERRIDE_PORT} ", environment_wins),
+            ("0", file_wins),
+            ("abc", file_wins),
+            ("70000", file_wins),
+            ("-1", file_wins),
+            ("True", file_wins),
+            ("", file_wins),
+            (None, file_wins),
         ):
             with self.subTest(override=override):
                 with _environment(**{health.ENV_PORT: override}):
                     self.assertEqual(health._resolve_port(document), expected)
+        literal_wins = (health.FALLBACK_PORT, health.FROM_FALLBACK)
         for override, expected in (
-            (str(OVERRIDE_PORT), OVERRIDE_PORT),
-            ("abc", health.FALLBACK_PORT),
-            (None, health.FALLBACK_PORT),
+            (str(OVERRIDE_PORT), environment_wins),
+            ("abc", literal_wins),
+            (None, literal_wins),
         ):
             with self.subTest(override=override, document="unusable"):
                 with _environment(**{health.ENV_PORT: override}):
                     self.assertEqual(health._resolve_port({"port": "nope"}), expected)
+        # A configured 0 is as unusable as a configured "nope": both fall through.
+        with _environment(**{health.ENV_PORT: None}):
+            self.assertEqual(health._resolve_port({"port": 0}), literal_wins)
 
     def test_an_absent_variable_is_not_the_same_input_as_a_blank_one(self):
         """Both resolve to the next link, but by different routes -- so both are tested."""
+        host_literal = (health.FALLBACK_HOST, health.FROM_FALLBACK)
+        port_literal = (health.FALLBACK_PORT, health.FROM_FALLBACK)
         with _environment(**{health.ENV_HOST: None, health.ENV_PORT: None}):
             self.assertNotIn(health.ENV_HOST, os.environ)
             self.assertNotIn(health.ENV_PORT, os.environ)
-            self.assertEqual(health._resolve_host({}), health.FALLBACK_HOST)
-            self.assertEqual(health._resolve_port({}), health.FALLBACK_PORT)
+            self.assertEqual(health._resolve_host({}), host_literal)
+            self.assertEqual(health._resolve_port({}), port_literal)
         with _environment(**{health.ENV_HOST: "", health.ENV_PORT: ""}):
             self.assertEqual(os.environ[health.ENV_HOST], "")
             self.assertEqual(os.environ[health.ENV_PORT], "")
-            self.assertEqual(health._resolve_host({}), health.FALLBACK_HOST)
-            self.assertEqual(health._resolve_port({}), health.FALLBACK_PORT)
+            self.assertEqual(health._resolve_host({}), host_literal)
+            self.assertEqual(health._resolve_port({}), port_literal)
 
     def test_the_environment_helper_restores_a_pre_existing_value(self):
         """A self-guard on the fixture: nesting restores the outer value, not the default."""
@@ -3023,8 +3255,8 @@ class TestHealthEndpointOverHttp(PayloadContractAssertions, unittest.TestCase):
     socket of its own: a handler-level fixture is fast, needs no process and
     cannot be affected by the entry point's own configuration.  That is a
     deliberate division of labour, not a gap -- ``server.py`` is exercised as a
-    real process by :class:`TestServerProcessLifecycle`, which gives it
-    ``HEALTH_PORT=0`` so it too never binds 8000.
+    real process by :class:`TestServerProcessLifecycle`, which gives it a
+    reserved free port so it too never binds 8000.
     """
 
     _server = None
@@ -3390,8 +3622,8 @@ class TestHealthEndpointOverHttp(PayloadContractAssertions, unittest.TestCase):
         Each of them resolves to ``/health`` under some parser's normalization --
         dot-segment collapsing, percent-decoding, or resolution against a base URL
         that discards the authority.  The handler compares the *raw* origin-form
-        path against the frozen constant and normalizes nothing, so each one is a
-        different path and each one is a 404.
+        path against the resolved served path and normalizes nothing, so each one
+        is a different path and each one is a 404.
 
         Why this matters beyond tidiness: an alias is an undocumented route.  A
         probe watching ``/health`` and an operator reading the contract would agree
@@ -3755,7 +3987,7 @@ class _DegradedConfigurationFixture(unittest.TestCase):
             leave it absent.  The sentinel ``_AS_DIRECTORY`` creates a directory
             in its place, which is how an unreadable source is simulated without
             depending on file permissions -- those behave differently for a
-            process running as root, which is exactly how CI runs.
+            process running as root, which many automated environments do.
         :param serving: the same, for ``config/health.json``.
         :returns: the executed module.
         """
@@ -3795,8 +4027,8 @@ class TestDegradedConfigurationSignaling(_DegradedConfigurationFixture):
     The endpoint answers ``200`` with a complete, valid body whether its declared
     configuration loaded or not -- which is the correct behaviour and also the
     problem: nothing at the endpoint distinguishes declared identity from
-    fallback identity, so a container built without its configuration file looks
-    perfectly healthy while serving values nobody declared.
+    fallback identity, so a deployment that did not ship its configuration file
+    looks perfectly healthy while serving values nobody declared.
 
     These tests pin the mechanism that closes that gap, and equally importantly
     pin what it must never disclose.
@@ -3896,9 +4128,9 @@ class TestDegradedConfigurationSignaling(_DegradedConfigurationFixture):
     def test_the_diagnostic_discloses_no_configuration_data(self):
         """The text is built from constants, so it cannot leak what it read.
 
-        This is the property that makes the diagnostic safe to emit into a CI log
-        or a container log: an operator learns the category, and nothing about the
-        filesystem, the file's contents, or the environment.
+        This is the property that makes the diagnostic safe to emit into any log:
+        an operator learns the category, and nothing about the filesystem, the
+        file's contents, or the environment.
         """
         secret = b'[project]\nname = "s3cr3t-value"\nversion = "1.0.0"\nx = "/etc/shadow"\n'
         module = self._load(identity=secret, serving=b"{ broken")
@@ -3947,10 +4179,13 @@ class TestDegradedConfigurationSignaling(_DegradedConfigurationFixture):
 class TestHandlerFailureReporting(_DegradedConfigurationFixture):
     """A client that disconnects is not a defect; a defect must not look like one.
 
-    Both used to reach the same silent branch, which meant an internal fault in
-    the handler was indistinguishable from an ordinary aborted poll -- and since
-    the contract defines no ``5xx``, nothing about it was visible at the endpoint
-    either.  A fault that appears nowhere is a fault nobody fixes.
+    A poller that hangs up mid-response and a genuine fault inside the handler
+    both end the same way on the wire -- the connection simply closes -- and since
+    the contract defines no ``5xx``, neither is distinguishable from the endpoint
+    either.  So the two must be told apart *before* the connection is abandoned,
+    and only the second may be reported: a fault that appears nowhere is a fault
+    nobody fixes, while a logged line per aborted poll is noise that hides real
+    ones.  These tests pin that classifier in both directions.
 
     An isolated module copy is used throughout, so the reporting latch these
     tests exercise belongs to the copy and the real module's state is never
@@ -4644,7 +4879,7 @@ class TestServerHelpers(unittest.TestCase):
 
 
 class TestServerListenerLifecycle(PayloadContractAssertions, unittest.TestCase):
-    """``create_server`` and ``serve_until_signalled``, in process, on port 0.
+    """``create_server`` and ``serve_until_signalled``, in process, on an ephemeral port.
 
     Every listener here is bound to ``127.0.0.1`` on an ephemeral port and closed
     by a registered cleanup, so the tier's port 8000 is never taken and nothing
@@ -4664,7 +4899,7 @@ class TestServerListenerLifecycle(PayloadContractAssertions, unittest.TestCase):
         return listener, bound_host, bound_port
 
     def test_the_listener_is_configured_for_prompt_orderly_shutdown(self):
-        """The four class attributes a container stop depends on."""
+        """The four class attributes an orderly stop depends on."""
         listener, _, _ = self._bind()
         self.assertTrue(listener.daemon_threads, "a handler must not outlive the process")
         self.assertFalse(
@@ -4688,8 +4923,13 @@ class TestServerListenerLifecycle(PayloadContractAssertions, unittest.TestCase):
 
             answered = 0
 
-            def do_GET(self):  # noqa: N802 - stdlib handler naming
-                """Answer exactly as the contract requires, and record the call."""
+            def do_GET(self):
+                """Answer exactly as the contract requires, and record the call.
+
+                The upper-case verb in the method name is
+                :class:`~http.server.BaseHTTPRequestHandler`'s dispatch
+                convention, not a naming choice this suite is free to make.
+                """
                 type(self).answered += 1
                 super().do_GET()
 
@@ -4818,7 +5058,7 @@ class TestServerListenerLifecycle(PayloadContractAssertions, unittest.TestCase):
     def test_a_released_port_can_be_rebound_immediately(self):
         """The proof that the release is real: the same port is taken again at once.
 
-        This is the property a container restart and a CI re-run both depend on.
+        This is the property any immediate restart depends on.
         """
         listener, bound_host, bound_port = self._bind()
         thread = threading.Thread(
@@ -4892,7 +5132,7 @@ class TestServerListenerLifecycle(PayloadContractAssertions, unittest.TestCase):
     def test_serving_is_silent(self):
         """Neither stream is written by serving: the start-up line is the only output.
 
-        Per-request logging would put one line in the container log for every
+        Per-request logging would put one line in the process log for every
         health poll, which is why the handler silences it -- and why this asserts
         the absence over a real socket rather than by reading the override.
         """
@@ -4917,16 +5157,17 @@ class TestServerListenerLifecycle(PayloadContractAssertions, unittest.TestCase):
 class TestServerProcessLifecycle(PayloadContractAssertions, unittest.TestCase):
     """``python server.py`` as a real child process, from start-up to exit status.
 
-    This is the only class that runs the entry point the way a container does, and
+    This is the only class that runs the entry point end to end as a program, and
     it is the only way to assert the three things that are properties of the
     *process* rather than of any function: the single announced start-up line, the
     exit status after a signal, and the two-line diagnostic when a bind fails.
 
     Safety is arranged rather than hoped for.  Every child is given
-    ``HEALTH_PORT=0`` and ``HEALTH_HOST=127.0.0.1``, so no child can bind the
-    tier's port 8000 or publish a socket on another interface -- except the two
-    cases that deliberately bind an address the kernel must refuse, which is the
-    behaviour under test.  ``PYTHONDONTWRITEBYTECODE`` keeps a child from
+    ``HEALTH_HOST=127.0.0.1`` and a ``HEALTH_PORT`` that
+    :func:`_reserve_free_port` has just reserved and released, so no child can
+    bind the tier's port 8000 or publish a socket on another interface -- except
+    the two cases that deliberately bind an address the kernel must refuse, which
+    is the behaviour under test.  ``PYTHONDONTWRITEBYTECODE`` keeps a child from
     materializing ``__pycache__`` inside the repository.  Every wait is bounded and
     every child is terminated -- escalating to ``SIGKILL`` -- by a registered
     cleanup, so neither a hang nor a failure can leave a listener behind.
@@ -4939,11 +5180,22 @@ class TestServerProcessLifecycle(PayloadContractAssertions, unittest.TestCase):
         return process
 
     def _spawn_serving(self):
-        """Start a child on an ephemeral loopback port and await its start-up line."""
+        """Start a child on a reserved free loopback port and await its start-up line.
+
+        A reserved concrete port rather than ``0``: a configured ``0`` is rejected,
+        so passing it would fall through to the tier's own 8000 and publish a
+        service on the port an operator expects to be the real application.
+        """
+        requested = _reserve_free_port()
         process = self._spawn(
-            **{health.ENV_HOST: LOOPBACK_HOST, health.ENV_PORT: str(EPHEMERAL_PORT)}
+            **{health.ENV_HOST: LOOPBACK_HOST, health.ENV_PORT: str(requested)}
         )
         announcement = process.await_startup()
+        self.assertEqual(
+            announcement["port"],
+            requested,
+            "the child must bind the port it was given, not fall back to another",
+        )
         return process, announcement
 
     def test_the_process_announces_its_bound_address_in_one_line(self):
@@ -4953,7 +5205,7 @@ class TestServerProcessLifecycle(PayloadContractAssertions, unittest.TestCase):
         self.assertEqual(announcement["path"], EXPECTED_PATH)
         self.assertEqual(announcement["name"], EXPECTED_NAME)
         self.assertEqual(announcement["version"], EXPECTED_VERSION)
-        self.assertGreater(announcement["port"], 0, "an ephemeral port, not 0")
+        self.assertGreater(announcement["port"], 0, "a real port, never 0")
         self.assertNotEqual(
             announcement["port"], TIER_PORT, "a test child must never bind 8000"
         )
@@ -5020,7 +5272,7 @@ class TestServerProcessLifecycle(PayloadContractAssertions, unittest.TestCase):
         """After serving many requests, the log is still exactly one line.
 
         A health endpoint is polled continuously, so a single logged line per
-        request would be the noisiest thing in the container log.
+        request would be the noisiest thing in the log.
         """
         process, announcement = self._spawn_serving()
         host, port = announcement["host"], announcement["port"]
@@ -5033,7 +5285,7 @@ class TestServerProcessLifecycle(PayloadContractAssertions, unittest.TestCase):
         self.assertEqual(process.stderr_lines, [])
 
     def test_sigterm_stops_the_process_cleanly(self):
-        """The container-stop path: exit 0, no traceback, and the port released."""
+        """The orderly-stop path: exit 0, no traceback, and the port released."""
         self._assert_signal_stops_cleanly(signal.SIGTERM)
 
     def test_sigint_stops_the_process_cleanly(self):
@@ -5080,15 +5332,11 @@ class TestServerProcessLifecycle(PayloadContractAssertions, unittest.TestCase):
         non-zero *exit code* -- which is what a bind failure produces -- would mean
         something went wrong.
 
-        That window is not hypothetical.  Sweeping the gap between the two signals
-        across 25 runs each measured ``0`` throughout at gaps up to 100 microseconds
-        and ``-SIGTERM`` for the great majority of runs from roughly 200
-        microseconds onward, with both outcomes appearing at intermediate gaps.
-        Asserting ``0`` alone would therefore be a test that fails for a reason that
-        is not a defect.
-
-        The single-signal cases above pin the exact ``0`` status, so nothing is lost
-        by admitting both outcomes here.
+        That window is not hypothetical: both outcomes are reachable depending on
+        how far apart the two signals land, so asserting ``0`` alone would be a
+        test that fails for a reason that is not a defect.  The single-signal
+        cases above pin the exact ``0`` status, so nothing is lost by admitting
+        both outcomes here.
         """
         process, announcement = self._spawn_serving()
         host, port = announcement["host"], announcement["port"]
@@ -5152,7 +5400,7 @@ class TestServerProcessLifecycle(PayloadContractAssertions, unittest.TestCase):
         network traffic.
         """
         process = self._spawn(
-            **{health.ENV_HOST: "192.0.2.1", health.ENV_PORT: str(EPHEMERAL_PORT)}
+            **{health.ENV_HOST: "192.0.2.1", health.ENV_PORT: str(_reserve_free_port())}
         )
         status = process.wait()
 
@@ -5175,11 +5423,13 @@ class TestServerProcessLifecycle(PayloadContractAssertions, unittest.TestCase):
         than being rejected with a usage error.  Passing one for real is what makes
         this a test of behaviour instead of a restatement of the docstring.
         """
+        requested = _reserve_free_port()
         process = self._spawn(
             ("--port=9999", "unexpected"),
-            **{health.ENV_HOST: LOOPBACK_HOST, health.ENV_PORT: str(EPHEMERAL_PORT)},
+            **{health.ENV_HOST: LOOPBACK_HOST, health.ENV_PORT: str(requested)},
         )
         announcement = process.await_startup()
+        self.assertEqual(announcement["port"], requested)
 
         self.assertEqual(announcement["host"], LOOPBACK_HOST)
         self.assertNotEqual(

@@ -1,12 +1,9 @@
 """Health payload builder and HTTP request handler for ``child_repo_10_LOC``.
 
-Identity and serving parameters resolve **once**, at import time, through the
-per-setting precedence chains tabulated below.  The clock, by contrast, is read
-on every call, and the millisecond value handed out is strictly increasing, so
-``timestamp`` proves liveness rather than mere reachability.
+What this module does:
 
 * it resolves this application's identity and serving parameters -- and only
-  those -- **once**, at import time, through distinct precedence chains: they
+  those -- **once**, at import time, through distinct precedence chains.  They
   are deliberately not uniform, because not every setting is a deployment
   parameter:
 
@@ -14,24 +11,25 @@ on every call, and the millisecond value handed out is strictly increasing, so
   ``name``, ``version``  ``pyproject.toml`` -> compiled-in literal
   ``host``, ``port``     ``HEALTH_HOST``/``HEALTH_PORT`` ->
                          ``config/health.json`` -> compiled-in literal
-  ``path``               ``config/health.json`` -> compiled-in literal
-  ``status``             a compiled-in protocol constant, no chain at all
+  ``path``, ``status``   ``config/health.json`` -> compiled-in literal,
+                         with the declaration *validated* against the
+                         contract before it is adopted
   =====================  ==============================================
 
   Identity is declared by the repository rather than by whoever starts the
-  process, and the resource path and the status literal are part of the frozen
-  contract rather than knobs, so neither group takes an environment override.
-  Only the bind address is a genuine deployment concern, and only it has one;
+  process, and the contract admits exactly one legal value for the path and the
+  status, so neither group takes an environment override.  Only the bind address
+  is a free deployment concern, and only it has one.  :func:`get_config_sources`
+  reports which link supplied each value, so an adopted declaration and a
+  refused one are distinguishable even though both yield the literal;
 * it records *why* a declared source was not used, so that falling back to a
   literal is survivable **and** observable -- see
   :func:`describe_configuration_degradation`, which ``server.py`` reports once
   at start-up;
 * it builds the frozen four-member health payload, reading the clock on every
-  call -- and handing out a *strictly increasing* millisecond value, so two
-  consecutive responses always differ -- which is what makes the ``timestamp``
-  member proof of liveness rather than of mere reachability, and taking
-  ``status`` from a compiled-in protocol constant that no configuration file and
-  no environment variable can influence;
+  call and handing out a *strictly increasing* millisecond value, so two
+  consecutive responses always differ and ``timestamp`` proves liveness rather
+  than mere reachability;
 * it serializes that payload to the exact bytes the contract mandates; and
 * it exposes :class:`HealthRequestHandler`, a
   :class:`http.server.BaseHTTPRequestHandler` subclass implementing the
@@ -63,16 +61,16 @@ the apex repository, implemented identically by the JavaScript tier's
     GET      /unknown     -> 404 {"error":"Not Found"}
     POST     <any path>   -> 405 {"error":"Method Not Allowed"} + Allow: GET, HEAD
 
-Two values in that contract are **frozen constants rather than settings**: the
-resource path ``/health`` and the ``status`` literal ``UP``.  Neither is read
-from configuration.  ``config/health.json`` declares both so that an operator can
-see the whole shape of what is served in one place, but a declared value that
-differs from the frozen literal is *rejected and reported* -- see
-:func:`frozen_value_conflicts` -- because every workflow assertion and container
-``HEALTHCHECK`` in this composition is written against those two literals.  A
-settable path would move the endpoint away from where monitoring looks for it and
-a settable status would let a deployment report a value its own behaviour does
-not support, in both cases while still returning a syntactically valid response.
+Two values in that contract are **validated settings rather than free ones**:
+the resource path ``/health`` and the ``status`` literal ``UP``.  Both are read
+from ``config/health.json`` like every other setting -- it declares them so that
+an operator can see the whole shape of what is served in one place -- but a
+declared value is adopted only when it restates the contract's literal exactly.
+Anything else is *rejected and reported* (see :func:`_resolve_frozen_value` and
+:func:`frozen_value_conflicts`), because a freely settable path would move the
+endpoint away from where a probe looks for it and a freely settable status would
+let a deployment report a value its own behaviour does not support -- in both
+cases while still returning a syntactically valid response.
 
 The path comparison is made against the **raw origin-form request target** with
 only the query component removed.  Nothing else is done to it: no dot segment is
@@ -119,8 +117,17 @@ __all__ = [
     "HOST",
     "PORT",
     "HEALTH_PATH",
+    "HEALTH_STATUS",
     "get_config",
-    # The audit trail for the two values configuration may not redefine.
+    # Per-value provenance, so an adopted declaration and a refused one can be
+    # told apart even when both yield the same value.
+    "CONFIG_SOURCES",
+    "get_config_sources",
+    "FROM_ENVIRONMENT",
+    "FROM_FILE",
+    "FROM_FALLBACK",
+    # The audit trail for the two values configuration may declare but not
+    # redefine.
     "FROZEN_CONFLICTS",
     "frozen_value_conflicts",
     "declared_status",
@@ -212,23 +219,22 @@ PAYLOAD_KEYS = ("name", "version", "timestamp", "status")
 #: The one value the ``status`` member may ever carry: the literal ``UP``,
 #: uppercase, exactly two characters.
 #:
-#: This is a **wire-protocol constant, not a setting**, and the distinction is
-#: the whole reason it lives in this block rather than among the resolved
-#: configuration below.  ``status`` reports what the process observed about
-#: itself while answering this request; a value read from a configuration file
-#: or an environment variable reports what somebody typed.  Were it
-#: configurable, a deployment could publish ``"DOWN"`` from a perfectly healthy
-#: process -- or, worse, two tiers of one composition could disagree about the
-#: vocabulary itself -- and every consumer of the contract (an orchestrator's
-#: liveness poller, the container ``HEALTHCHECK``, the CI probe) would be
-#: reading a claim rather than a measurement.
+#: ``status`` is a **validated setting**: ``config/health.json`` is its declared
+#: source and the declaration really is read, but it is adopted only when it is
+#: exactly this literal.  Anything else is rejected in favour of this constant,
+#: recorded by :func:`frozen_value_conflicts` and reported once at start-up.
 #:
-#: ``config/health.json`` still *declares* this literal, because the contract
-#: document is normative for all three tiers and the declaration keeps the
-#: file a complete description of the endpoint.  That member is never read
-#: here: the test suite instead pins the declaration to this constant, so the
-#: two can never drift while the wire value stays beyond configuration's
-#: reach.  The Java tier hard-codes the same literal for the same reason.
+#: Both halves of that are deliberate.  The value is read from a declared source
+#: because every value this endpoint serves should trace to one, rather than
+#: being written inline at its point of use; and it is validated because
+#: ``status`` reports what the process observed about itself while answering the
+#: request, not what somebody typed.  Were the declaration honoured unchecked, a
+#: deployment could publish ``"DOWN"`` from a perfectly healthy process -- or two
+#: tiers of one composition could disagree about the vocabulary itself -- and
+#: every consumer of the contract would be reading a claim rather than a
+#: measurement.
+#:
+#: The Java tier applies the same rule to its own declared source.
 STATUS_UP = "UP"
 
 #: Compact JSON separators.  See the module docstring for the measured md5
@@ -239,16 +245,15 @@ JSON_SEPARATORS = (",", ":")
 #: ``Content-Length`` is the length of the encoded bytes, not a character count.
 JSON_ENCODING = "utf-8"
 
-#: The three status codes the contract's normal vocabulary defines, and the only
-#: three this module ever sends.  No 5xx appears among them, because a routed
-#: request performs no I/O -- it reads already-resolved values and one clock --
-#: and so has no failure path of its own; ``docs/health-endpoint.md`` §5.1 has no
-#: row that produces one.  Should something inside this process break anyway, the
-#: endpoint fails closed rather than answering a misleading ``404`` or ``2xx``, in
-#: whichever way its runtime allows (§9.3.1): here that is
-#: :meth:`HealthRequestHandler._abandon_connection`, which sends nothing at all,
-#: while the sibling tiers -- which can still put a status line on the wire --
-#: answer ``503``.
+#: The three status codes the contract defines, and the only three this module
+#: ever sends.  No 5xx appears among them, because a routed request performs no
+#: I/O -- it reads already-resolved values and one clock -- and so has no failure
+#: path of its own; ``docs/health-endpoint.md`` §5.1 has no row that produces one.
+#: Should something inside this process break anyway, no status outside these
+#: three is invented: the fault is reported server-side and the exchange is
+#: completed at the transport level, which is what
+#: :meth:`HealthRequestHandler._abandon_connection` does here and what both
+#: sibling tiers do too (§9.3.1).
 STATUS_OK = 200
 STATUS_NOT_FOUND = 404
 STATUS_METHOD_NOT_ALLOWED = 405
@@ -277,26 +282,19 @@ _last_issued_millis = -1
 # ---------------------------------------------------------------------------
 # Compiled-in literals
 #
-# For ``name``, ``version``, ``host`` and ``port`` these are the last link in
-# the precedence chain, and a requirement rather than a nicety: they guarantee
-# the endpoint still serves a valid contract when a configuration file is
-# missing from a container image -- precisely the failure mode a health endpoint
-# has to survive.  An endpoint that cannot answer because its own configuration
-# is absent is worse than no endpoint at all.
+# These are the last link in every precedence chain, and a requirement rather
+# than a nicety: they guarantee the endpoint still serves a valid contract when
+# a configuration file cannot be read at all -- precisely the failure mode a
+# health endpoint has to survive.  An endpoint that cannot answer because its
+# own configuration is absent is worse than no endpoint at all.
 #
-# ``FALLBACK_PATH`` is a different kind of value: for the served path there is
-# no chain at all.  It, and the status literal :data:`STATUS_UP`, are the frozen
-# contract constants themselves, used directly by the router and the payload
-# builder, and configuration can only ever restate them (see
-# :func:`frozen_value_conflicts`).  The ``FALLBACK_`` name is kept for
-# continuity with the other four and because it is still exactly what the
-# phrase describes -- the value compiled into this file.
+# ``FALLBACK_PATH`` and :data:`STATUS_UP` differ from the other four in one
+# respect only: their chain has no environment layer and its file layer is
+# *validated*, so a declaration is adopted only when it restates the literal
+# exactly (see :func:`_resolve_frozen_value`).  They are still resolved values
+# read from a declared source, not values written inline at their point of use.
 # ---------------------------------------------------------------------------
 
-# There is deliberately no fallback for ``status``: a fallback is the last link
-# of a resolution chain, and ``status`` has no chain to be the last link of.  It
-# is :data:`STATUS_UP`, always, in every environment and with every
-# configuration file present or absent.
 FALLBACK_NAME = "child_repo_10_LOC"
 FALLBACK_VERSION = "1.0.0"
 FALLBACK_HOST = "0.0.0.0"
@@ -304,9 +302,25 @@ FALLBACK_PORT = 8000
 FALLBACK_PATH = "/health"
 
 #: The two configuration keys whose declared value may only ever restate the
-#: frozen constant beside it.  Consulted by :func:`frozen_value_conflicts` and by
-#: nothing else: no code path reads a value *from* this mapping to serve with.
+#: frozen constant beside it.  Consulted by :func:`_resolve_frozen_value`, which
+#: decides what is served, and by :func:`frozen_value_conflicts`, which records
+#: what was refused.
 _FROZEN_BY_KEY = {"path": FALLBACK_PATH, "status": STATUS_UP}
+
+# ---------------------------------------------------------------------------
+# Provenance labels
+#
+# Which link of a chain supplied each resolved value.  Exported through
+# :func:`get_config_sources` so that an operator -- and the test suite -- can
+# tell an adopted declaration from a refused one *even when the two produce the
+# same value*, which is exactly the case for the two validated settings whose
+# only legal declaration is the literal itself.  Without this, "the endpoint
+# reports UP" is satisfied equally by a live chain and by a dead one.
+# ---------------------------------------------------------------------------
+
+FROM_ENVIRONMENT = "environment"
+FROM_FILE = "file"
+FROM_FALLBACK = "fallback"
 
 #: Environment overrides for this tier.  Levels 2 and 3 prefix their variables
 #: while Level 1 uses the bare ``PORT``/``HOST``; that asymmetry is deliberate
@@ -314,10 +328,16 @@ _FROZEN_BY_KEY = {"path": FALLBACK_PATH, "status": STATUS_UP}
 ENV_HOST = "HEALTH_HOST"
 ENV_PORT = "HEALTH_PORT"
 
-#: Inclusive bounds accepted for a port.  ``0`` is permitted and means "let the
-#: operating system assign an ephemeral port", which is how a test can bind a
-#: listener without colliding with a running server on 8000.
-_MIN_PORT = 0
+#: Inclusive bounds accepted for a *configured* port.  ``0`` is deliberately
+#: excluded, and that exclusion is the one cross-tier port policy: all three
+#: tiers reject a configured ``0`` identically.  Port ``0`` asks the operating
+#: system to choose a port at random, so a process that honoured it would bind an
+#: address no fixed-number probe could predict -- the endpoint would be running
+#: and unreachable at the same time, which is the exact condition a health
+#: endpoint exists to rule out.  A test that wants an ephemeral port still gets
+#: one: it passes ``0`` to the server constructor, which is a bind-time argument
+#: rather than configuration.
+_MIN_PORT = 1
 _MAX_PORT = 65535
 
 # ---------------------------------------------------------------------------
@@ -344,7 +364,7 @@ _MAX_PORT = 65535
 SOURCE_IDENTITY = "identity"
 SOURCE_SERVING = "serving"
 
-#: The file is not there.  Ordinary in a container image built without it.
+#: The file is not there -- ordinary in any deployment that did not ship it.
 DEGRADED_MISSING = "declared source missing"
 
 #: The file is there but could not be opened or read -- permissions, or a
@@ -453,21 +473,26 @@ def _classify_load_failure(error):
 
 
 def _read_identity(path):
-    """Read ``(name, version, reason)`` from a ``pyproject.toml``.  Never raises.
+    """Read identity from a ``pyproject.toml``.  Never raises.
 
     ``tomllib.load`` requires a binary stream, hence ``"rb"``.  Every failure
     mode still collapses to the literal fallbacks -- a missing or unreadable
     file (``OSError``), malformed TOML (``tomllib.TOMLDecodeError``, a
     ``ValueError`` subclass), an absent ``[project]`` table or key
     (``KeyError``), or a document whose ``project`` entry is not a table
-    (``TypeError``) -- but the *reason* is now returned alongside them instead
-    of being discarded, so the fallback is distinguishable from a successful
-    load.
+    (``TypeError``) -- but the *reason* is returned alongside them instead of
+    being discarded, so the fallback is distinguishable from a successful load.
+
+    Provenance is reported per value rather than per file, because the two are
+    not the same thing: a document can load cleanly and still supply a blank or
+    wrongly-typed ``name``, in which case that one value falls back while the
+    file itself did not fail.
 
     :param path: the ``pyproject.toml`` to read.
-    :returns: ``(name, version, reason)``, where ``reason`` is ``None`` on the
-        ordinary path and otherwise one of this module's fixed reason
-        constants.  It never carries a path or a file's contents.
+    :returns: ``((name, name_source), (version, version_source), reason)``, where
+        each source is :data:`FROM_FILE` or :data:`FROM_FALLBACK` and ``reason``
+        is ``None`` on the ordinary path and otherwise one of this module's fixed
+        reason constants.  Neither ever carries a path or a file's contents.
     """
     try:
         with open(path, "rb") as handle:
@@ -476,12 +501,29 @@ def _read_identity(path):
         name = project["name"]
         version = project["version"]
     except (OSError, ValueError, KeyError, TypeError) as error:
-        return FALLBACK_NAME, FALLBACK_VERSION, _classify_load_failure(error)
+        return (
+            (FALLBACK_NAME, FROM_FALLBACK),
+            (FALLBACK_VERSION, FROM_FALLBACK),
+            _classify_load_failure(error),
+        )
     return (
-        _coerce_text(name, FALLBACK_NAME),
-        _coerce_text(version, FALLBACK_VERSION),
+        _labelled_text(name, FALLBACK_NAME),
+        _labelled_text(version, FALLBACK_VERSION),
         None,
     )
+
+
+def _labelled_text(declared, fallback):
+    """Return ``(value, source)`` for one declared text value.
+
+    A blank or wrongly-typed declaration is treated as absent, exactly as
+    :func:`_coerce_text` treats it, and labelled :data:`FROM_FALLBACK` so the
+    substitution is visible rather than implied by the value alone.
+    """
+    value = _coerce_text(declared, None)
+    if value is None:
+        return fallback, FROM_FALLBACK
+    return value, FROM_FILE
 
 
 def _read_serving_document(path):
@@ -513,33 +555,76 @@ def _read_serving_document(path):
 
 
 def _resolve_host(document):
-    """Resolve the bind address: ``HEALTH_HOST`` -> config -> literal."""
+    """Resolve the bind address: ``HEALTH_HOST`` -> config -> literal.
+
+    :returns: ``(value, source)``, where ``source`` is one of
+        :data:`FROM_ENVIRONMENT`, :data:`FROM_FILE` or :data:`FROM_FALLBACK`.
+    """
     override = _coerce_text(os.environ.get(ENV_HOST), None)
     if override is not None:
-        return override
-    return _coerce_text(document.get("host"), FALLBACK_HOST)
+        return override, FROM_ENVIRONMENT
+    declared = _coerce_text(document.get("host"), None)
+    if declared is not None:
+        return declared, FROM_FILE
+    return FALLBACK_HOST, FROM_FALLBACK
 
 
 def _resolve_port(document):
     """Resolve the bind port: ``HEALTH_PORT`` -> config -> literal.
 
-    An override that is set but unusable (``HEALTH_PORT=abc``, ``=99999``) does
-    not short-circuit to the literal; it falls through to the configuration
-    file first, so the chain degrades one link at a time.
+    An override that is set but unusable (``HEALTH_PORT=abc``, ``=99999``,
+    ``=0``) does not short-circuit to the literal; it falls through to the
+    configuration file first, so the chain degrades one link at a time.
+
+    :returns: ``(value, source)``, labelled as in :func:`_resolve_host`.
     """
     override = _coerce_port(os.environ.get(ENV_PORT), None)
     if override is not None:
-        return override
-    return _coerce_port(document.get("port"), FALLBACK_PORT)
+        return override, FROM_ENVIRONMENT
+    declared = _coerce_port(document.get("port"), None)
+    if declared is not None:
+        return declared, FROM_FILE
+    return FALLBACK_PORT, FROM_FALLBACK
+
+
+def _resolve_frozen_value(document, key):
+    """Resolve a contract-frozen value, adopting a declaration only if it is legal.
+
+    This is what makes ``path`` and ``status`` genuinely *resolved settings*
+    rather than either dead declarations or free ones.  ``config/health.json`` is
+    the declared source for both -- it carries them so an operator sees the whole
+    shape of what is served in one place -- so the value that routes and the value
+    that is reported are read from that source like every other setting.  What
+    differs is the validation: the contract admits exactly one legal value for
+    each, so a declaration is adopted only when it matches that value exactly,
+    and anything else is *rejected* rather than honoured.
+
+    A rejection never refuses to serve.  The frozen literal is used, so the
+    endpoint keeps answering the contract; the rejection is recorded by
+    :func:`_find_frozen_conflicts` and reported once at start-up; and the
+    returned label is :data:`FROM_FALLBACK`, so neither an operator nor a test can
+    mistake a rejected declaration for an honoured one.
+
+    :param document: the parsed serving document, or an empty mapping.
+    :param key: ``"path"`` or ``"status"`` -- a key of :data:`_FROZEN_BY_KEY`.
+    :returns: ``(frozen_literal, source)``, where ``source`` is
+        :data:`FROM_FILE` when the declaration was read and adopted and
+        :data:`FROM_FALLBACK` when it was absent, blank, of the wrong type or
+        rejected.
+    """
+    frozen = _FROZEN_BY_KEY[key]
+    declared = _coerce_text(document.get(key), None)
+    if declared == frozen:
+        return frozen, FROM_FILE
+    return frozen, FROM_FALLBACK
 
 
 def _find_frozen_conflicts(document):
     """Return one descriptor per declared value that redefines a frozen constant.
 
-    The resource path and the status literal are part of the contract, not of
-    the deployment, so they are never *resolved* -- the constants are used
-    directly.  What this function does is notice that a document declared
-    something else, so the rejection can be reported rather than swallowed.
+    The companion to :func:`_resolve_frozen_value`: that function decides what is
+    served, and this one records what was refused, so a rejection can be reported
+    rather than swallowed.
 
     A key that is absent produces nothing, and a key that restates the frozen
     value exactly produces nothing either: ``config/health.json`` declares both
@@ -571,11 +656,11 @@ def _find_frozen_conflicts(document):
 def declared_status(document):
     """Return the ``status`` a serving document declares, or ``None``.
 
-    Read for inspection only.  The reported status is **not** resolved from this
-    value -- see :data:`STATUS_UP` -- so this function exists so that a consumer
-    (the test suite, or an operator reading the resolved configuration) can see
-    what a file declared and compare it against the literal, rather than having
-    to re-implement the read.
+    Read for inspection, separately from resolution.  What is *served* comes from
+    :func:`_resolve_frozen_value`, which validates the declaration before adopting
+    it; this function reports the raw declaration, so a consumer -- the test suite,
+    or an operator reading the resolved configuration -- can compare what a file
+    asked for against what was served without re-implementing the read.
 
     A document that declares nothing, or declares a blank value, yields
     ``None``: the same treatment every other setting gives a blank declaration.
@@ -596,7 +681,11 @@ _SERVING_DOCUMENT, _SERVING_DEGRADATION = _read_serving_document(CONFIG_PATH)
 #: Application identity, from ``pyproject.toml`` with literal fallbacks.  There
 #: is no environment override for either value: identity is declared by the
 #: repository, not by the deployment.
-APP_NAME, APP_VERSION, _IDENTITY_DEGRADATION = _read_identity(PYPROJECT_PATH)
+(
+    (APP_NAME, _NAME_SOURCE),
+    (APP_VERSION, _VERSION_SOURCE),
+    _IDENTITY_DEGRADATION,
+) = _read_identity(PYPROJECT_PATH)
 
 #: Why each declared source was not used, in declared order -- empty on the
 #: ordinary path.  Each entry is ``"<category>: <reason>"``, assembled purely
@@ -621,14 +710,27 @@ CONFIG_DEGRADATIONS = tuple(
 #: Resolved serving parameters.  ``server.py`` consumes these rather than
 #: duplicating the defaults, so there is exactly one place in this tier where
 #: the precedence chain is applied.
-HOST = _resolve_host(_SERVING_DOCUMENT)
-PORT = _resolve_port(_SERVING_DOCUMENT)
+HOST, _HOST_SOURCE = _resolve_host(_SERVING_DOCUMENT)
+PORT, _PORT_SOURCE = _resolve_port(_SERVING_DOCUMENT)
 
-#: The one path served.  Assigned from the frozen constant rather than resolved
-#: from any source, so nothing outside this file can move the endpoint.  The one
-#: status reported has no resolved form at all -- it is :data:`STATUS_UP`, read
-#: directly by the payload builder.
-HEALTH_PATH = FALLBACK_PATH
+#: The one path served and the one status reported, both resolved from
+#: ``config/health.json`` and both validated against the contract before the
+#: declaration is adopted, so a declared value can never move the endpoint or
+#: change what it claims.  See :func:`_resolve_frozen_value`.
+HEALTH_PATH, _PATH_SOURCE = _resolve_frozen_value(_SERVING_DOCUMENT, "path")
+HEALTH_STATUS, _STATUS_SOURCE = _resolve_frozen_value(_SERVING_DOCUMENT, "status")
+
+#: Which link of its chain supplied each resolved value, keyed exactly as
+#: :func:`get_config`.  See the provenance-label block above for why this is
+#: exported rather than inferred from the values themselves.
+CONFIG_SOURCES = {
+    "name": _NAME_SOURCE,
+    "version": _VERSION_SOURCE,
+    "host": _HOST_SOURCE,
+    "port": _PORT_SOURCE,
+    "path": _PATH_SOURCE,
+    "status": _STATUS_SOURCE,
+}
 
 #: Declared values that were rejected for redefining a frozen constant, computed
 #: once at import.  Empty for the configuration this repository ships, because
@@ -683,14 +785,14 @@ def get_config():
     logs the bound address, or the test suite when it asserts the resolution
     chain -- cannot mutate the module's resolved state.
 
-    ``status`` is deliberately **absent**.  This mapping is the resolved
-    *configuration*, and the reported status is not configuration: it is the
-    protocol constant :data:`STATUS_UP`.  Including it here would invite a
-    caller to treat it as an adjustable value.
+    Every value the endpoint serves appears here, including the two validated
+    ones: each traces to a declared source rather than to a literal written
+    inline at its point of use.  :func:`get_config_sources` says which link of
+    each chain supplied the value.
 
     >>> config = get_config()
     >>> sorted(config)
-    ['host', 'name', 'path', 'port', 'version']
+    ['host', 'name', 'path', 'port', 'status', 'version']
     """
     return {
         "name": APP_NAME,
@@ -698,7 +800,22 @@ def get_config():
         "host": HOST,
         "port": PORT,
         "path": HEALTH_PATH,
+        "status": HEALTH_STATUS,
     }
+
+
+def get_config_sources():
+    """Return a fresh copy of :data:`CONFIG_SOURCES`, keyed as :func:`get_config`.
+
+    Copied for the same reason the configuration is: a caller must not be able to
+    rewrite the module's record of where its own values came from.
+
+    >>> sorted(get_config_sources())
+    ['host', 'name', 'path', 'port', 'status', 'version']
+    >>> set(get_config_sources().values()) <= {'environment', 'file', 'fallback'}
+    True
+    """
+    return dict(CONFIG_SOURCES)
 
 
 # Payload construction.
@@ -783,15 +900,15 @@ def build_payload():
     """Build the frozen four-member health payload.  Socket-free.
 
     Socket-free and side-effect-free: callable directly by the test suite with
-    no listener bound.  ``name`` and ``version`` come from the identity resolved
-    at import.  ``status`` is read straight from the frozen protocol constant
-    :data:`STATUS_UP` rather than from resolved configuration, so the value a
-    consumer receives is guaranteed by this one line: no configuration file, no
-    environment variable and no change to configuration handling elsewhere can
-    alter what this endpoint reports about itself.  Only ``timestamp`` is
-    evaluated here, on every call.  Dictionaries preserve insertion order and
-    ``json.dumps`` honours it, so the insertion order below *is* the wire order
-    (see :data:`PAYLOAD_KEYS`).
+    no listener bound.  ``name``, ``version`` and ``status`` are the values
+    resolved once at import; only ``timestamp`` is evaluated here.  Dictionaries
+    preserve insertion order and ``json.dumps`` honours it, so the insertion
+    order below *is* the wire order (see :data:`PAYLOAD_KEYS`).
+
+    :data:`HEALTH_STATUS` is guaranteed to be :data:`STATUS_UP` -- its resolution
+    validates the declaration against the contract before adopting it -- so no
+    configuration file and no environment variable can alter what this endpoint
+    reports about itself, while the value still traces to a declared source.
 
     ``timestamp`` is evaluated here on every call -- never cached, memoized or
     captured at start-up -- because that is what makes the endpoint proof of
@@ -802,7 +919,7 @@ def build_payload():
         "name": APP_NAME,
         "version": APP_VERSION,
         "timestamp": current_timestamp(),
-        "status": STATUS_UP,
+        "status": HEALTH_STATUS,
     }
 
 
@@ -1068,9 +1185,10 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     #: milliseconds, so ten seconds is generous.
     timeout = 10
 
-    #: The frozen path this handler answers on.  Read through the class so a
-    #: subclass can be pointed elsewhere in a test without mutating module state;
-    #: configuration cannot reach it.
+    #: The path this handler answers on: the value resolved at import, which
+    #: validation guarantees is the contract's literal.  Read through the class so
+    #: a subclass can be pointed elsewhere in a test without mutating module
+    #: state, which a configuration document cannot do.
     health_path = HEALTH_PATH
 
     #: Upper bound on a request body this handler will consume before giving up
@@ -1225,15 +1343,12 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
 
         Closing the connection is the whole of the correct *response* behaviour
         at this tier -- the socket is released and the next probe gets a clean
-        one.  This is the Level 2 half of the cross-tier internal-fault policy in
-        ``docs/health-endpoint.md`` §9.3.1: the endpoint fails closed in whichever
-        way its runtime allows.  Levels 1 and 3 can still put a status line on the
-        wire when nothing has been sent yet, so both answer ``503`` there; here
-        the status line has already gone out by the time ``_send`` can fail, and
-        ``send_response`` cannot be issued twice on one exchange, so a second
-        response is not available to be sent.  Both behaviours are conformant, and
-        a ``503`` is in neither case part of the endpoint's normal vocabulary --
-        §5.1's matrix has no row that produces one.
+        one.  All three tiers do the same thing, which is the cross-tier
+        internal-fault policy in ``docs/health-endpoint.md`` §9.3.1: report the
+        fault server-side and complete the exchange at the transport level,
+        inventing no status the contract does not define.  §5.1's matrix has
+        exactly three rows -- ``200``, ``404``, ``405`` -- and none of them
+        produces a ``5xx``, so none is synthesised here either.
 
         What closing cannot do is explain itself, which is why the cause is
         classified rather than discarded:

@@ -7,9 +7,9 @@
 #
 # Deliberately minimal: this repository is an application launched directly with
 # `python server.py`, not a distributable package, so it declares no build
-# backend, no runtime requirements and no tooling sections. This composition runs
-# on the standard library alone, and every section omitted here is one that would
-# either declare a capability that does not exist or name a package to install.
+# backend, no runtime requirements and no tooling sections. That is repository
+# policy rather than an oversight -- this composition runs on the standard library
+# alone, and nothing here is built, packaged or published.
 
 [project]
 name = "child_repo_10_LOC"
