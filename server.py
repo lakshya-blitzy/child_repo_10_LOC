@@ -1,106 +1,55 @@
-"""Level 2 (``child_repo_10_LOC``) health endpoint entry point.
+"""Health endpoint entry point for ``child_repo_10_LOC``.
 
-This module is the Python tier's long-lived process: it binds a TCP listener,
-serves the ``/health`` contract through the request handler defined in the
-sibling ``health.py``, and shuts that listener down in an orderly fashion when
-the process is asked to stop.  It does nothing else.  Every decision about
-*what* the endpoint answers -- the payload, the compact serialization, the
-header set, the ``405`` and the ``404`` -- belongs to ``health.py`` and is
-deliberately not restated here, because duplicating a contract across two files
-is how three independently written tiers drift out of agreement.
+Binds a TCP listener, serves the ``/health`` contract through the request
+handler in the sibling ``health.py``, and shuts the listener down in an orderly
+fashion when asked to stop.  It does nothing else.  Every decision about *what*
+the endpoint answers -- the payload, the compact serialization, the header set,
+the ``405``, the ``404`` -- belongs to ``health.py`` and is deliberately not
+restated here, because duplicating a contract across two files is how
+independently written tiers drift out of agreement.
 
-Why this file exists at all
----------------------------
+This tier has two parallel entry points, and that split is the whole point:
+``python app.py`` prints ``Hello Lakshya`` and exits, exactly as it always has;
+``python server.py`` binds ``0.0.0.0:8000`` and stays alive.  A listener makes a
+process long-lived, so the listener lives *here* and never on the default path.
 
-This tier has **two parallel entry points**, and that is the whole reason for
-the split:
+Four invariants this module holds:
 
-===========================  ==========================================
-``python app.py``            prints ``Hello Lakshya`` and exits 0.
-                             Pre-existing behaviour, asserted by CI as a
-                             permanent regression gate.  Untouched.
-``python server.py``         binds ``0.0.0.0:8000``, serves ``/health``,
-                             stays alive.  This file.
-===========================  ==========================================
-
-The health endpoint is purely additive.  Before it, nothing in this composition
-was long-lived: all behaviour happened during script initialisation, with no
-event loop, no asynchrony and no deferred callback.  A listener makes a process
-long-lived for the first time, so the listener lives *here* -- in a separate
-entry point -- and never on the default path.  ``python app.py`` therefore still
-terminates immediately, which is exactly what the preservation requirement
-demands.
-
-What this module guarantees
----------------------------
-
-* **Nothing binds at import.**  Importing this module defines classes and
-  functions and returns; it opens no socket, starts no thread, installs no
-  signal handler and writes nothing to either stream.  ``python -c "import
-  server"`` is inert, which is what lets a test import the factory below and
-  bind its own listener on an ephemeral port.
-* **One line of output, once.**  The bound address is announced exactly once,
-  at start-up, flushed immediately so it appears even when standard output is a
-  pipe (which is how CI captures it).  Nothing is logged per request -- the
-  handler in ``health.py`` silences that -- and nothing is logged on shutdown
-  either, so the log holds exactly one line for the entire lifetime of the
-  process.  There is no logging framework anywhere in this tier.
+* **Nothing binds at import.**  Importing defines classes and functions and
+  returns: no socket, no thread, no signal handler, nothing written to either
+  stream.  That is what lets a test import the factory below and bind its own
+  listener on an ephemeral port.
+* **One line of output, once.**  The bound address is announced at start-up and
+  flushed immediately so it survives a pipe.  Nothing is logged per request and
+  nothing on shutdown.  There is no logging framework in this tier.
 * **Prompt, orderly shutdown on ``SIGTERM`` and ``SIGINT``.**  Both stop the
-  accept loop, release the listening socket and exit ``0`` with no traceback.  A
-  container stop is therefore not a hard kill, and a workflow teardown leaves no
-  orphaned port binding to break the next run.  See
-  :func:`serve_until_signalled` for how the deadlock inherent in the naive
-  approach is avoided.
-* **A failed bind is reported, never disguised.**  If the port is already in
-  use the process explains which address it could not take and how to choose
-  another, then exits non-zero.  It never silently moves to a different port:
-  every probe in this composition targets a known port, and a silent shift would
-  turn a clear failure into a confusing one.
-* **Zero third-party packages.**  ``http.server.ThreadingHTTPServer`` from the
-  standard library, and nothing else.  Flask, FastAPI, Starlette, uvicorn,
-  gunicorn and waitress were each considered and rejected: any one of them would
-  give this repository its first pip dependency and its first
-  virtual-environment contract.  The composition's third-party runtime
-  dependency count is zero and stays zero.
+  accept loop, release the socket and exit ``0`` with no traceback, so a stop
+  that was asked for leaves no orphaned port binding behind.  See
+  :func:`serve_until_signalled` for the deadlock the naive approach hits.
+* **A failed bind is reported, never disguised**, and never worked around by
+  moving to another port: every probe targets a known port, so a silent shift
+  would turn a clear failure into a confusing one.
 
-Configuration
--------------
+Standard library only -- ``http.server.ThreadingHTTPServer`` and nothing else.
+Flask, FastAPI, Starlette, uvicorn, gunicorn and waitress were each considered
+and rejected: any one would give this repository its first pip dependency.
 
-The bound address resolves through the uniform precedence chain
-``environment variable -> configuration file -> compiled-in literal``, applied
-in exactly one place in this tier: ``health.py``, at import time.  This module
-*consumes* the result (:data:`health.HOST`, :data:`health.PORT`) rather than
-re-deriving it, so the two files can never disagree about a default.  For this
-tier the overrides are ``HEALTH_HOST`` and ``HEALTH_PORT``; the bare ``HOST``
-and ``PORT`` belong to the Level 1 apex application and are deliberately not
-read here.
-
-===================  ==========================================
-``HEALTH_HOST``      bind address; default ``0.0.0.0``
-``HEALTH_PORT``      bind port; default ``8000``
-===================  ==========================================
-
-``0.0.0.0`` is a bind address only -- it means "every local interface" and is
-never a destination.  Probe the running server on ``127.0.0.1``.
-
-Usage
------
-
-.. code-block:: bash
+The bound address resolves through ``environment variable -> configuration file
+-> compiled-in literal``, applied in exactly one place in this tier
+(``health.py``, at import).  This module *consumes* :data:`health.HOST` and
+:data:`health.PORT` rather than re-deriving them, so the two cannot disagree
+about a default.  The overrides here are ``HEALTH_HOST`` and ``HEALTH_PORT``;
+the bare ``HOST`` and ``PORT`` belong to the apex application and are
+deliberately not read.  ``0.0.0.0`` is a bind address only -- it means "every
+local interface" and is never a destination, so probe ``127.0.0.1``::
 
     python server.py
     curl -i http://127.0.0.1:8000/health
     HEALTH_PORT=8100 HEALTH_HOST=127.0.0.1 python server.py
 
-Level independence
-------------------
-
-Nothing here references another tier.  The Level 1 JavaScript application and
-the Level 3 Java application implement the same contract in their own
-languages, from their own repositories, and the three share a *documented*
-contract (``docs/health-endpoint.md`` in the apex repository) rather than a
-runtime artefact.  There is no import across a tier boundary, in either
-direction, and no file in this repository reads that document at run time.
+Nothing here references another tier: no import crosses a tier boundary in
+either direction, and nothing in this repository reads the shared contract
+document at run time.
 """
 
 import errno
@@ -111,29 +60,20 @@ import threading
 from http.server import ThreadingHTTPServer
 from pathlib import Path
 
-# ---------------------------------------------------------------------------
-# Tier-local import bootstrap
-#
-# ``health`` sits beside this file at the repository root.  Launching a script
-# by path already puts that directory on ``sys.path``, but two other entry
-# routes do not: ``python -m server`` resolves against the current working
-# directory, and an embedded interpreter may start with a path that omits it
-# entirely.  Deriving the directory from ``__file__`` rather than from the
-# working directory makes every route behave identically -- from the repository
-# root, from a parent directory, or as ``/app/server.py`` inside the container
-# image, which is precisely the CWD independence the container entry point
-# depends on.
-#
-# The insert is idempotent and additive: an already-present entry is left where
-# it is, so a caller that has deliberately arranged its own path ordering keeps
-# it.
-# ---------------------------------------------------------------------------
+# Tier-local import bootstrap.  ``health`` sits beside this file.  Launching a
+# script by path already puts that directory on ``sys.path``, but ``python -m
+# server`` resolves against the current working directory instead, and an
+# embedded interpreter may start with a path that omits it entirely.  Deriving
+# the directory from ``__file__`` makes every route behave identically wherever
+# the process is launched from.  The insert is idempotent and additive, so a
+# caller that arranged its own path ordering keeps it.
 
 _MODULE_DIR = str(Path(__file__).resolve().parent)
 if _MODULE_DIR not in sys.path:
     sys.path.insert(0, _MODULE_DIR)
 
-import health  # noqa: E402 - deliberately after the sys.path bootstrap above
+# Deliberately after the bootstrap above: the import cannot resolve before it.
+import health
 
 __all__ = [
     # The listener.
@@ -144,7 +84,10 @@ __all__ = [
     "SHUTDOWN_SIGNALS",
     "EXIT_OK",
     "EXIT_BIND_FAILURE",
+    "EXIT_SHUTDOWN_FAILURE",
+    "UNSAFE_HOST_TEXT",
     # Behaviour, in the order the entry point uses it.
+    "report_frozen_value_conflicts",
     "resolve_bind_address",
     "create_server",
     "startup_line",
@@ -152,28 +95,20 @@ __all__ = [
     "main",
 ]
 
-# ---------------------------------------------------------------------------
-# Declared defaults
-#
-# Re-exported from ``health`` rather than spelled again, so that "the default
-# port is 8000" is stated in exactly one place in this tier.  A consumer -- the
-# test suite, or a reader -- can assert against these names instead of
-# hard-coding a literal that would then need changing in two files.
-# ---------------------------------------------------------------------------
+# Declared defaults, re-exported from ``health`` rather than spelled again, so
+# "the default port is 8000" is stated in exactly one place in this tier.
 
 #: Bind address of last resort: every local interface.
 DEFAULT_HOST = health.FALLBACK_HOST
 
 #: Bind port of last resort.  Each tier owns a distinct default port (3000 for
 #: Level 1, 8000 here, 8080 for Level 3) because all three applications may run
-#: simultaneously on one host during validation -- and in the apex workflow they
-#: do.  Reusing another tier's port would make them collide.
+#: simultaneously on one host; reusing another tier's port would collide.
 DEFAULT_PORT = health.FALLBACK_PORT
 
-#: The signals that mean "stop serving".  ``SIGTERM`` is what a container
-#: runtime and a CI teardown send; ``SIGINT`` is Ctrl-C at a terminal.  Both are
-#: handled identically, and both exit ``0``: an orderly stop that was asked for
-#: is a success, not a failure.
+#: The signals that mean "stop serving".  ``SIGTERM`` is the conventional
+#: request to terminate; ``SIGINT`` is Ctrl-C at a terminal.  Both are handled
+#: identically and both exit ``0``: a stop that was asked for is a success.
 SHUTDOWN_SIGNALS = (signal.SIGTERM, signal.SIGINT)
 
 #: Exit status after an orderly shutdown.
@@ -184,12 +119,23 @@ EXIT_OK = 0
 #: targets 8000 must fail loudly if 8000 could not be taken.
 EXIT_BIND_FAILURE = 1
 
+#: Exit status when the listener served correctly but could not be shut down
+#: cleanly.  A distinct code, because the two failures call for opposite
+#: responses: a bind failure means nothing ever served, while this means
+#: something served and may still hold the port, so a supervisor about to restart
+#: this process needs to know the socket might not be free yet.
+#:
+#: The value ``2`` carries no special meaning for a process exit status.  It is
+#: reserved by convention for a container health-check *probe command*, which
+#: must return exactly 0 or 1 -- and this module is never a probe: a probe would
+#: be a separate one-shot client, not the server itself.
+EXIT_SHUTDOWN_FAILURE = 2
+
 #: How long :meth:`~socketserver.BaseServer.serve_forever` waits between checks
 #: of its shutdown flag.  A signal interrupts the wait immediately (PEP 475
 #: retries the call with the *remaining* timeout), so this value bounds how long
 #: the loop can take to notice a shutdown request -- a fifth of a second, which
-#: keeps a container stop and a CI teardown prompt while costing five idle
-#: wake-ups a second.
+#: keeps a requested stop prompt while costing five idle wake-ups a second.
 _POLL_INTERVAL = 0.2
 
 #: Upper bound on the wait for the shutdown helper thread to finish.  It exists
@@ -198,10 +144,46 @@ _POLL_INTERVAL = 0.2
 #: even an expired join cannot keep the interpreter alive.
 _SHUTDOWN_JOIN_TIMEOUT = 5.0
 
-#: Prefix for diagnostics on standard error, so a message in an interleaved CI
-#: log is attributable.  Derived from this file's own name rather than from
+#: Prefix for diagnostics on standard error, so a message in an interleaved log
+#: is attributable.  Derived from this file's own name rather than from
 #: ``sys.argv[0]``, which an embedding process controls and may leave empty.
 _PROGRAM = Path(__file__).name
+
+# ---------------------------------------------------------------------------
+# Diagnostic sanitization
+#
+# Every value this process writes to a log is either one of its own literals, a
+# stable error category, or a host and port that came from configuration.  The
+# last of those is the only caller-controlled text in the set, and a log is a
+# sink an attacker or a careless value can pollute: one newline is enough to
+# forge an additional entry that a human or a parser then trusts.  The constants
+# below define what a renderable host may contain, and what is printed instead
+# when it does not qualify.
+# ---------------------------------------------------------------------------
+
+#: Rendered in place of a host that is not safe or not usable to print.  The
+#: same token is used by every tier of this composition, so an operator can grep
+#: one string across all three logs.
+UNSAFE_HOST_TEXT = "<unprintable>"
+
+#: Rendered in place of a port that is not a number.
+UNSAFE_PORT_TEXT = "<unprintable>"
+
+#: Longest host text rendered.  Comfortably above the 253-octet maximum of a DNS
+#: name is unnecessary here: a bind address in this composition is a literal or a
+#: short name, and a bound protects the log line's legibility.
+_MAX_HOST_LENGTH = 64
+
+#: Characters a renderable host may contain: a DNS name, an IPv4 literal, an
+#: IPv6 literal, or an IPv6 literal with a zone identifier such as
+#: ``fe80::1%eth0``.  Deliberately excludes whitespace and every control
+#: character, which is what makes log-line forgery impossible.
+_HOST_SAFE_CHARACTERS = frozenset(
+    "abcdefghijklmnopqrstuvwxyz"
+    "ABCDEFGHIJKLMNOPQRSTUVWXYZ"
+    "0123456789"
+    ".:-_%"
+)
 
 
 def _usable_host(value):
@@ -267,15 +249,76 @@ def _address_family(host):
     return socket.AF_INET
 
 
+def _sanitize_host(host):
+    """Return ``host`` if it is safe to render, else :data:`UNSAFE_HOST_TEXT`.
+
+    The host reaching a diagnostic is configuration-controlled: it arrives from
+    ``HEALTH_HOST`` or from ``config/health.json``, both of which an operator (or
+    anything able to set this process's environment) can fill with arbitrary
+    text.  Writing it to a log unchecked makes the log a sink for that text, and
+    a single newline in it is enough to forge a whole additional log entry --
+    a fabricated "listening on ..." line, say, in a log a human or a parser
+    later trusts.
+
+    Rather than escape the dangerous characters and still print the value, an
+    unusable host is replaced outright.  A host that is not a name, an IPv4
+    literal or an IPv6 literal cannot be bound anyway, so there is nothing an
+    operator could do with the exact bytes; the useful information is that the
+    configured value was not a host at all, and that is what the placeholder
+    says.  The permitted set covers every form that can legitimately appear,
+    including an IPv6 scope such as ``fe80::1%eth0``.
+
+    :param host: the configured host, of any type.
+    :returns: the host unchanged, or :data:`UNSAFE_HOST_TEXT`.
+    """
+    if not isinstance(host, str):
+        return UNSAFE_HOST_TEXT
+    if not host or len(host) > _MAX_HOST_LENGTH:
+        return UNSAFE_HOST_TEXT
+    if any(character not in _HOST_SAFE_CHARACTERS for character in host):
+        return UNSAFE_HOST_TEXT
+    return host
+
+
 def _format_authority(host, port):
-    """Return ``host:port`` in URL authority form.
+    """Return ``host:port`` in URL authority form, safely.
 
     An IPv6 literal is bracketed, as RFC 3986 requires, so that the address in
     the start-up line is one a reader can paste into a client unchanged.
+
+    Sanitizing here rather than at each call site is deliberate: this is the one
+    function through which every rendering of a host passes -- the start-up line
+    and both lines of the bind-failure diagnostic -- so a future diagnostic
+    cannot accidentally bypass the check.  The port is coerced through
+    :func:`int` for the same reason, since a non-numeric port would otherwise be
+    interpolated verbatim.
     """
-    if isinstance(host, str) and ":" in host:
-        return f"[{host}]:{port}"
-    return f"{host}:{port}"
+    safe_host = _sanitize_host(host)
+    try:
+        safe_port = int(port)
+    except (TypeError, ValueError):
+        safe_port = UNSAFE_PORT_TEXT
+    if ":" in safe_host:
+        return f"[{safe_host}]:{safe_port}"
+    return f"{safe_host}:{safe_port}"
+
+
+def _printable(text):
+    """Return ``text`` with control characters removed.
+
+    The last line of defence for the diagnostic sink.  Every caller already
+    passes text assembled from module constants, a sanitized host and a stable
+    error category, so in practice this changes nothing -- which is the point: it
+    holds even if a future diagnostic is added that forgets to sanitize its
+    inputs.  Removing rather than escaping keeps one logical line on one physical
+    line, which is what makes the output greppable.
+    """
+    if not isinstance(text, str):
+        return str(text).replace("\n", " ").replace("\r", " ")
+    return "".join(
+        character if character.isprintable() or character == " " else " "
+        for character in text
+    )
 
 
 def _write_stderr(lines):
@@ -286,68 +329,59 @@ def _write_stderr(lines):
     gone away, ``OSError`` (including ``BrokenPipeError``) is swallowed so that
     reporting a problem can never itself become the problem -- most importantly,
     so that it can never mask the exit status the caller is about to return.
+    ``ValueError`` is caught alongside it for the detached-stream case, where the
+    underlying buffer is gone rather than merely broken.
+
+    Each line is passed through :func:`_printable` first, so one call can never
+    produce more log entries than it was given lines.
     """
     for line in lines:
         try:
-            print(f"{_PROGRAM}: {line}", file=sys.stderr, flush=True)
-        except OSError:
+            print(f"{_PROGRAM}: {_printable(line)}", file=sys.stderr, flush=True)
+        except (OSError, ValueError):
             return
 
 
-# ---------------------------------------------------------------------------
 # The listener
-# ---------------------------------------------------------------------------
 
 
 class HealthHTTPServer(ThreadingHTTPServer):
     """The tier's listener: threaded, promptly closeable, single-port.
 
-    :class:`~http.server.ThreadingHTTPServer` rather than the single-threaded
-    :class:`~http.server.HTTPServer` because a health endpoint must answer
-    while it is being polled by several clients at once.  With one thread, a
-    client that opens a connection and stalls holds the accept loop, and every
-    subsequent probe -- an orchestrator's liveness poll, a container
-    ``HEALTHCHECK``, a workflow assertion -- queues behind it and eventually
-    times out.  A liveness probe that a slow client can silence reports the
-    opposite of the truth.
+    Threaded rather than :class:`~http.server.HTTPServer` because a health
+    endpoint must answer while several clients poll it at once.  With one
+    thread, a client that opens a connection and stalls holds the accept loop
+    and every subsequent probe queues behind it -- a liveness probe a slow
+    client can silence reports the opposite of the truth.
 
-    Four class attributes are set explicitly rather than inherited, because
-    each one is load-bearing and two of them differ from the defaults:
+    All four class attributes are set explicitly because each is load-bearing:
 
     ``daemon_threads = True``
         Request threads must never keep the interpreter alive after the main
-        thread has finished.  The base class already sets this; it is repeated
-        here so the guarantee is visible at the point that depends on it rather
-        than inferred from a superclass.
+        thread finishes.  The base class already sets it; repeated here so the
+        guarantee is visible at the point that depends on it.
 
     ``block_on_close = False``
-        **Changed from the default**, and the single change that makes shutdown
-        provably prompt.  With the inherited ``True``,
-        :meth:`~socketserver.BaseServer.server_close` joins every in-flight
-        request thread -- and the handler in ``health.py`` speaks HTTP/1.1 with
-        a ten-second idle timeout, so one client holding an open keep-alive
-        connection would delay shutdown by up to ten seconds.  A container stop
-        would then look like a hang and be escalated to ``SIGKILL``.  With
-        ``False``, ``server_close`` closes the listening socket and returns
-        immediately, and the daemon request threads are reaped with the
-        interpreter.  The trade-off is explicit and correct for this workload:
-        a probe response is a handful of bytes built with no I/O, so the only
-        thing that can be interrupted is a reply to a caller that has itself
-        just been told the process is going away.
+        The single setting that makes shutdown provably prompt.  With ``True``,
+        ``server_close`` joins every in-flight request thread -- and the handler
+        speaks HTTP/1.1 with a ten-second idle timeout, so one client holding a
+        keep-alive connection would delay shutdown by up to ten seconds, which a
+        supervisor would read as a hang and escalate to ``SIGKILL``.  The
+        trade-off is correct for this workload: a probe response is a handful of
+        bytes built with no I/O, so the only thing interruptible is a reply to a
+        caller that has just been told the process is going away.
 
     ``allow_reuse_address = True``
-        ``SO_REUSEADDR``, so restarting immediately after a stop succeeds
-        instead of failing while the previous socket drains ``TIME_WAIT``.  It
-        does *not* let this server bind a port another process is actively
-        listening on, which is what keeps the port-in-use diagnostic honest.
+        ``SO_REUSEADDR``, so an immediate restart succeeds instead of failing
+        while the previous socket drains ``TIME_WAIT``.  It does *not* let this
+        server bind a port another process is actively listening on, which is
+        what keeps the port-in-use diagnostic honest.
 
     ``allow_reuse_port = False``
-        Stated explicitly because the default must never be relaxed here.
-        ``SO_REUSEPORT`` would let a second instance bind the *same live* port
-        and receive a share of the connections, so a duplicate start would
-        appear to succeed while probes reached whichever instance the kernel
-        chose.  Refusing it is what makes "the port is already in use" a
-        reliable answer.
+        Must never be relaxed.  ``SO_REUSEPORT`` would let a second instance
+        bind the *same live* port and take a share of the connections, so a
+        duplicate start would appear to succeed while probes reached whichever
+        instance the kernel chose.
     """
 
     daemon_threads = True
@@ -358,28 +392,25 @@ class HealthHTTPServer(ThreadingHTTPServer):
     def __init__(
         self,
         server_address,
-        RequestHandlerClass,  # noqa: N803 - name mandated by socketserver
+        RequestHandlerClass,
         bind_and_activate=True,
     ):
         """Bind ``server_address``, selecting the family it actually needs.
 
-        The socket family has to be decided before the base class creates the
-        socket, and the base class reads it from ``self``.  Setting it here --
-        before delegating -- is therefore the supported way to bind an IPv6
-        address, and it keeps the choice per-instance rather than mutating a
-        class attribute that a concurrently constructed server would see.
+        The socket family must be decided before the base class creates the
+        socket, and the base class reads it from ``self``, so setting it here
+        before delegating is the supported way to bind an IPv6 address -- and it
+        keeps the choice per-instance rather than mutating a class attribute a
+        concurrently constructed server would see.
 
-        Parameter naming follows :mod:`socketserver` exactly, capitalisation
-        included, so this subclass stays a drop-in replacement for callers that
-        pass by keyword.
+        The capitalised parameter name follows :mod:`socketserver` exactly, so
+        this subclass stays a drop-in replacement for keyword callers.
         """
         self.address_family = _address_family(server_address[0])
         super().__init__(server_address, RequestHandlerClass, bind_and_activate)
 
 
-# ---------------------------------------------------------------------------
 # Address resolution
-# ---------------------------------------------------------------------------
 
 
 def resolve_bind_address(host=None, port=None):
@@ -399,19 +430,15 @@ def resolve_bind_address(host=None, port=None):
     2. the value ``health.py`` resolved;
     3. :data:`DEFAULT_HOST` / :data:`DEFAULT_PORT`, the compiled-in literals.
 
-    Step 3 looks redundant -- ``health.py`` guarantees usable values -- and it
-    is kept deliberately.  The literal fallback is a requirement of the
-    contract rather than a nicety: the endpoint must still serve when its
-    configuration is absent from a container image, which is exactly the
-    failure mode a health endpoint has to survive.  Belonging to the entry point
-    as well as to the configuration reader means no single edit can remove it.
+    Step 3 looks redundant -- ``health.py`` guarantees usable values -- and is
+    kept deliberately.  The literal fallback is a contract requirement rather
+    than a nicety: the endpoint must still serve when its configuration is
+    absent from a deployment, which is exactly the failure a health endpoint has
+    to survive.  Belonging to the entry point as well as to the configuration
+    reader means no single edit can remove it.
 
-    :param host: bind address, or ``None`` to use the resolved configuration.
-    :param port: bind port (``0`` for an ephemeral port), or ``None`` to use the
-        resolved configuration.
-    :returns: a ``(host, port)`` tuple with a non-empty ``str`` host and an
-        ``int`` port in ``0..65535``.  Never raises, and never returns a value
-        the caller has to re-check.
+    Never raises, and never returns a value the caller has to re-check: the host
+    is a non-empty ``str`` and the port an ``int`` in ``0..65535``.
     """
     resolved_host = _usable_host(host)
     if resolved_host is None:
@@ -436,28 +463,17 @@ def create_server(
 ):
     """Build and bind a listener for the health endpoint, without serving.
 
-    Binding and serving are separated so that a caller can learn the port it
-    actually got -- which matters when it asked for ``0`` -- and can arrange its
-    own teardown, before a single request is accepted.  That is what makes the
-    endpoint testable end to end without a fixed port, and it is why this
-    function returns rather than blocking.
+    Binding and serving are separated so a caller can learn the port it actually
+    got -- which matters when it asked for ``0`` -- and arrange its own teardown
+    before a single request is accepted.  That is what makes the endpoint
+    testable end to end without a fixed port, and why this returns rather than
+    blocking.  Call :func:`serve_until_signalled` to run the result, or
+    ``server_close()`` if you decide not to.
 
-    :param host: bind address, or ``None`` for the resolved configuration.
-    :param port: bind port, or ``None`` for the resolved configuration.  Pass
-        ``0`` for an operating-system-assigned ephemeral port.
-    :param handler_class: the request handler.  Defaults to the handler that
-        implements the frozen contract; a subclass of it is the only sensible
-        substitution, since the contract is defined by that class and not here.
-    :param server_class: the server implementation.  Defaults to
-        :class:`HealthHTTPServer`.
-    :returns: a bound, listening, not-yet-serving server.  Call
-        :func:`serve_until_signalled` to run it, and ``server_close()`` if you
-        decide not to.
-    :raises OSError: if the address cannot be bound -- typically
-        ``EADDRINUSE``.  The partially built socket is closed by the base class
-        before the exception leaves, so a failed call leaks no descriptor.
-        :func:`main` translates this into a readable diagnostic;
-        :func:`_describe_bind_failure` is what it uses to do so.
+    Raises ``OSError`` when the address cannot be bound, typically
+    ``EADDRINUSE``.  The base class closes the partially built socket before the
+    exception leaves, so a failed call leaks no descriptor;
+    :func:`_describe_bind_failure` turns it into a readable diagnostic.
     """
     resolved_host, resolved_port = resolve_bind_address(host, port)
     return server_class((resolved_host, resolved_port), handler_class)
@@ -475,13 +491,10 @@ def startup_line(host, port, path=None):
     log records what the process did rather than what a client should type.
     Probes target ``127.0.0.1``.
 
-    :param host: the bound address, as reported by the socket.
-    :param port: the bound port, as reported by the socket -- so an ephemeral
-        port is logged as the number the kernel chose, not as ``0``.
-    :param path: the served path; defaults to the resolved
-        :data:`health.HEALTH_PATH`.
-    :returns: a single line with no trailing newline, of the form
-        ``listening on http://0.0.0.0:8000/health (child_repo_10_LOC 1.0.0)``.
+    ``host`` and ``port`` are the values the socket reports, so an ephemeral port
+    is logged as the number the kernel chose rather than as ``0``.  The result
+    carries no trailing newline and reads
+    ``listening on http://0.0.0.0:8000/health (child_repo_10_LOC 1.0.0)``.
     """
     served_path = path if path is not None else health.HEALTH_PATH
     authority = _format_authority(host, port)
@@ -492,9 +505,7 @@ def startup_line(host, port, path=None):
 
 
 
-# ---------------------------------------------------------------------------
 # Serving and orderly shutdown
-# ---------------------------------------------------------------------------
 
 
 def serve_until_signalled(server, signals=SHUTDOWN_SIGNALS):
@@ -503,16 +514,13 @@ def serve_until_signalled(server, signals=SHUTDOWN_SIGNALS):
     Returns only when the listener has stopped accepting and its socket has been
     released, so a caller may immediately rebind the same port.
 
-    The deadlock this avoids, and how
-    --------------------------------
-
-    :meth:`~socketserver.BaseServer.shutdown` stops the
+    The deadlock this avoids: :meth:`~socketserver.BaseServer.shutdown` stops the
     :meth:`~socketserver.BaseServer.serve_forever` loop and then *waits* for
     that loop to acknowledge.  CPython runs signal handlers on the main
     thread -- the very thread inside ``serve_forever`` -- so a handler that
     calls ``shutdown()`` directly waits for a loop it is itself blocking.  The
-    process hangs, the container stop escalates to ``SIGKILL``, and the
-    "orderly" shutdown was never orderly.
+    process hangs, a supervisor escalates to ``SIGKILL``, and the "orderly"
+    shutdown was never orderly.
 
     The fix is to move the ``shutdown()`` call off that thread, and to do so
     without creating a thread from inside a signal handler -- starting a thread
@@ -539,38 +547,59 @@ def serve_until_signalled(server, signals=SHUTDOWN_SIGNALS):
     * the ``finally`` block -- runs on every path, including an unexpected
       exception, so the socket is released even when the exit is not graceful.
 
-    Nothing is written to either stream here.  The start-up line is this
-    process's only output, and a shutdown notice would make the log two lines
-    where the contract says one.
+    Nothing is written to either stream on the ordinary path.  The start-up line
+    is this process's only output, and a "shutting down" notice would make the log
+    two lines where the contract says one.  The single exception is a shutdown
+    that did not complete: that is not the expected path, it cannot be observed
+    from anywhere else, and it changes what a supervisor should do next, so it
+    gets one line and a non-zero status.
 
     :param server: a bound server, as returned by :func:`create_server`.
     :param signals: the signals to treat as a shutdown request.  Defaults to
         :data:`SHUTDOWN_SIGNALS` (``SIGTERM`` and ``SIGINT``).
-    :returns: :data:`EXIT_OK`.  A shutdown that was asked for is a success.
+    :returns: :data:`EXIT_OK` when the shutdown completed -- a shutdown that was
+        asked for is a success -- or :data:`EXIT_SHUTDOWN_FAILURE` when
+        ``shutdown()`` raised or failed to return within
+        :data:`_SHUTDOWN_JOIN_TIMEOUT`.
     """
     stop_requested = threading.Event()
 
-    def _request_shutdown(signum, frame):  # noqa: ARG001 - stdlib handler signature
+    # The two parameters are the signal-handler signature the standard library
+    # calls this with; neither is needed, and neither may be dropped.
+    def _request_shutdown(signum, frame):
         """Signal handler: record the request and return immediately.
 
         Deliberately the smallest possible body.  Setting the event is the only
-        action taken; every consequence of it happens on the helper thread
-        below, on a thread that is safe to block.
+        action taken; every consequence happens on the helper thread below,
+        which is safe to block.
         """
         stop_requested.set()
+
+    # Reasons the shutdown did not complete cleanly, appended by the helper
+    # thread and read by the main thread after the join below.  A list is used
+    # because ``append`` is atomic and the join establishes the ordering, so no
+    # additional lock is needed for the hand-off.
+    shutdown_failures = []
 
     def _drive_shutdown():
         """Park until a shutdown is requested, then stop the accept loop."""
         stop_requested.wait()
         try:
             server.shutdown()
-        except Exception:  # noqa: BLE001 - fail closed; see below
+        except Exception as error:
             # ``shutdown`` sets a flag and waits on an event, so there is no
             # ordinary failure mode.  The guard exists because this is a daemon
             # thread: an escaping exception would print a traceback that looked
             # like an application fault, and the ``finally`` block below closes
-            # the socket regardless.  Swallowing it keeps the exit clean.
-            pass
+            # the socket regardless.
+            #
+            # What it must not do is stay quiet and let the process still report
+            # success.  A shutdown that failed means the accept loop may still be
+            # running and the port may still be held, so a supervisor that reads
+            # exit 0 and immediately restarts would hit a confusing bind failure
+            # instead of the real cause.  The category is recorded here and turned
+            # into both a diagnostic and a non-zero exit status below.
+            shutdown_failures.append(_error_category(error))
 
     previous_handlers = {}
     for signal_number in signals:
@@ -603,6 +632,12 @@ def serve_until_signalled(server, signals=SHUTDOWN_SIGNALS):
         # parked for the life of the process.
         stop_requested.set()
         shutdown_thread.join(_SHUTDOWN_JOIN_TIMEOUT)
+        if shutdown_thread.is_alive():
+            # The join expired, so ``shutdown()`` itself has not returned. The
+            # thread is a daemon and cannot keep the interpreter alive, but the
+            # accept loop was never confirmed stopped -- which is a failed
+            # shutdown by any useful definition, and is recorded as one.
+            shutdown_failures.append("Timeout")
         # Close after ``shutdown`` has been driven, in that order: the loop
         # stops accepting first, then the listening socket is released.  With
         # ``block_on_close`` False this returns at once, so the port is free for
@@ -617,12 +652,47 @@ def serve_until_signalled(server, signals=SHUTDOWN_SIGNALS):
             except (OSError, ValueError):
                 continue
 
+    if shutdown_failures:
+        # One line, built from a stable category, reported after the signal
+        # dispositions have been restored so the report cannot itself be
+        # interrupted by a second signal mid-write.
+        _write_stderr(
+            [
+                "shutdown did not complete cleanly"
+                f" ({', '.join(shutdown_failures)});"
+                " the listening socket was closed regardless",
+            ]
+        )
+        return EXIT_SHUTDOWN_FAILURE
+
     return EXIT_OK
 
 
-# ---------------------------------------------------------------------------
 # Bind failure reporting
-# ---------------------------------------------------------------------------
+
+
+def _error_category(error):
+    """Return a stable, log-safe category for ``error``.
+
+    Prefers the symbolic ``errno`` name -- ``EADDRINUSE``, ``EAFNOSUPPORT`` --
+    because it is the same token on every host and in every locale, which makes
+    it something an operator can search for and a runbook can name.  Falls back
+    to the exception's class name when there is no usable errno, as for
+    :exc:`socket.gaierror` variants that carry a resolver code instead.
+
+    Neither source can contain a path, an address or a control character: an
+    errno name and a Python class name are both identifiers.
+
+    :param error: the exception to categorize.
+    :returns: a short identifier-shaped token, never empty.
+    """
+    number = getattr(error, "errno", None)
+    if isinstance(number, int):
+        symbolic = errno.errorcode.get(number)
+        if symbolic:
+            return symbolic
+        return f"errno{number}"
+    return type(error).__name__ or "OSError"
 
 
 def _describe_bind_failure(port, error):
@@ -637,11 +707,8 @@ def _describe_bind_failure(port, error):
     The host is deliberately not a parameter: no branch below varies by it, and
     :func:`_report_bind_failure` already names the full ``host:port`` authority
     on the first line of the diagnostic.  ``port`` *is* needed, because the
-    privileged-port case is distinguishable only by its value.
-
-    :param port: the port that could not be bound.
-    :param error: the :exc:`OSError` the bind raised.
-    :returns: a two-item tuple of short, complete sentences.
+    privileged-port case is distinguishable only by its value.  The result is a
+    two-item tuple of short, complete sentences.
     """
     number = getattr(error, "errno", None)
 
@@ -684,11 +751,15 @@ def _describe_bind_failure(port, error):
             f" {DEFAULT_HOST} binds every interface and is the default",
         )
 
-    # Anything else: report the operating system's own wording, which is more
-    # informative than a guess, and still point at the two knobs that exist.
-    reason = getattr(error, "strerror", None) or str(error) or "bind failed"
+    # Anything else: report a stable category rather than the operating system's
+    # own wording.  ``strerror`` and ``str(error)`` are locale-dependent and, for
+    # some errors, interpolate the address or filename that failed -- so they
+    # make the diagnostic both unstable across hosts and capable of echoing
+    # configuration back into the log.  The symbolic errno name is the useful,
+    # greppable part and is identical everywhere; where there is no errno to name,
+    # the exception's own class name serves the same purpose.
     return (
-        reason,
+        f"bind failed ({_error_category(error)})",
         f"adjust {health.ENV_HOST} or {health.ENV_PORT} and retry",
     )
 
@@ -709,9 +780,41 @@ def _report_bind_failure(host, port, error):
     )
 
 
+def report_frozen_value_conflicts():
+    """Report, once at start-up, every configured value rejected as frozen.
+
+    The resource path and the ``status`` literal are contract constants, so
+    ``health.py`` serves them whatever ``config/health.json`` says.  Serving the
+    right thing is not by itself enough: a deployment that edited that document
+    expecting an effect would otherwise get silence, and would discover the truth
+    only from a monitoring gap.  One line per rejected value names the key, what
+    was configured, and what is served instead.
+
+    Standard error, because this reports a misconfiguration rather than normal
+    progress -- and emitted here rather than in ``health.py`` because that module
+    must stay importable without writing to either stream.  A correctly configured
+    deployment prints nothing at all, which is why this cannot add noise to a CI
+    log.
+
+    :returns: the number of conflicts reported, so a caller (or a test) can
+        assert on the count without parsing standard error.
+    """
+    conflicts = health.frozen_value_conflicts()
+    document = f"{health.CONFIG_PATH.parent.name}/{health.CONFIG_PATH.name}"
+    _write_stderr(
+        [
+            f'ignoring configured {key} "{configured}": {key} is frozen at '
+            f'"{frozen}" by the /health contract and is not a deployment '
+            f'setting. Remove the value or restore it to "{frozen}" in '
+            f"{document}."
+            for key, configured, frozen in conflicts
+        ]
+    )
+    return len(conflicts)
+
+
 # ---------------------------------------------------------------------------
 # Entry point
-# ---------------------------------------------------------------------------
 
 
 def main():
@@ -719,13 +822,25 @@ def main():
 
     The whole of the entry point, in the order it happens:
 
-    1. resolve the address to bind (:func:`resolve_bind_address`);
-    2. bind it, or report why not and return :data:`EXIT_BIND_FAILURE`;
-    3. announce the bound address in exactly one flushed line;
-    4. serve until ``SIGTERM`` or ``SIGINT``, then close and return
+    1. report a degraded configuration, if there is one, in one sanitized line;
+    2. report any configured value rejected for redefining a frozen contract
+       constant (:func:`report_frozen_value_conflicts`) -- nothing at all for a
+       correctly configured deployment;
+    3. resolve the address to bind (:func:`resolve_bind_address`);
+    4. bind it, or report why not and return :data:`EXIT_BIND_FAILURE`;
+    5. announce the bound address in exactly one flushed line;
+    6. serve until ``SIGTERM`` or ``SIGINT``, then close and return
        :data:`EXIT_OK`.
 
-    Step 2 never falls back to a different port.  A probe in this composition
+    Step 1 is what makes the fallback chain observable. Falling back to a literal
+    keeps the endpoint answering when its configuration is missing, which is
+    correct; doing so invisibly is not, because the endpoint then reports ``UP``
+    with fallback-sourced identity and nothing anywhere says so.  Both reports
+    come before the bind so that either warning is visible even when the bind
+    then fails: a misconfigured document and an occupied port are independent
+    problems, and one must not hide the other.
+
+    Step 4 never falls back to a different port.  A probe in this composition
     always targets a known port -- 8000 here -- so a silent move would replace a
     clear failure with a confusing one: a process that appeared to start while
     every probe against it timed out.
@@ -735,9 +850,29 @@ def main():
     flags would create a third source of truth for values that already have
     exactly one.  ``python server.py`` takes no arguments and needs none.
 
-    :returns: :data:`EXIT_OK` after an orderly shutdown, or
-        :data:`EXIT_BIND_FAILURE` if the listener could not be bound.
+    :returns: :data:`EXIT_OK` after an orderly shutdown,
+        :data:`EXIT_BIND_FAILURE` if the listener could not be bound, or
+        :data:`EXIT_SHUTDOWN_FAILURE` if it served but could not be stopped
+        cleanly.
     """
+    # Report a degraded configuration before anything else, so the reason the
+    # values below look wrong is already in the log when they are used. This is
+    # the one place it is reported: ``health.py`` deliberately stays silent on
+    # import, because a module that logs when it is merely read corrupts the
+    # output of every program that reads it.
+    #
+    # Nothing is printed on the ordinary path. A "configuration OK" line on every
+    # run would train a reader to skip the line, which is exactly the run where
+    # it would have mattered.
+    degraded = health.describe_configuration_degradation()
+    if degraded is not None:
+        _write_stderr([degraded])
+
+    # Then report anything the deployment declared that this tier refused to
+    # adopt because it would have redefined a frozen contract constant.  A
+    # correctly configured deployment prints nothing here either.
+    report_frozen_value_conflicts()
+
     host, port = resolve_bind_address()
 
     try:
