@@ -1,70 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
 
-  <!--
-    ChildRepo10Loc.Tests - the xUnit test project for the child_repo_10_LOC repository.
-
-    PURPOSE
-      This project is the executable half of the migration's behavior-preservation
-      guarantee. The greeting logic ported into the application project is asserted here
-      as a pure function, so the observable contract ("Hello Lakshya") is locked by a test
-      rather than merely claimed in documentation. The complementary end-to-end
-      standard-output byte comparison deliberately lives in the continuous-integration
-      workflow instead of here, because the application entry point is emitted as a
-      private synthesized member that a referencing assembly cannot invoke.
-
-    BUILD CONFIGURATION
-      No target framework, language version, nullability, implicit-using, analysis or
-      determinism property is declared in this file. Every one of them is inherited from
-      the single Directory.Build.props at the repository root, which MSBuild discovers by
-      walking up from this directory. Keeping exactly one source of truth is what reduces
-      a future framework upgrade to a one-property edit; restating any inherited value
-      here would silently create a second place to maintain. For the same reason this
-      directory intentionally contains no nested properties file and no nested editor
-      configuration, either of which would shadow the repository-root settings.
-  -->
-
   <PropertyGroup>
-
-    <!--
-      Test assemblies are never published to a package feed. The deployable artifact of
-      this repository is the container image built from its Dockerfile, and that build
-      context excludes this directory entirely.
-    -->
     <IsPackable>false</IsPackable>
-
-    <!--
-      Identifies the assembly as a test project so the test host and the coverage
-      collector wire themselves in, and so solution-wide tooling can tell it apart from
-      production code.
-    -->
     <IsTestProject>true</IsTestProject>
-
-    <!--
-      Scoped, deliberate suppression - do NOT remove it, and do NOT promote it to the
-      shared repository-root properties file.
-
-      This repository escalates every warning to an error and enables the recommended
-      analysis rule set. One of those rules rejects underscores in member names, which is
-      irreconcilable with the Method_Scenario_Expectation fact-naming convention used by
-      the sibling test class: without this line the very first build fails outright rather
-      than merely warning.
-
-      Two details are load-bearing. The suppression is APPENDED to the inherited value
-      instead of replacing it, so every diagnostic the SDK and the shared properties file
-      already exempt stays exempt. And it is confined to this test project, so production
-      code remains under the full, unmodified gate.
-    -->
+    <!-- CA1707 is scoped to this test project because the test naming convention uses underscores. -->
     <NoWarn>$(NoWarn);CA1707</NoWarn>
-
   </PropertyGroup>
 
-  <!--
-    The complete third-party dependency surface of this repository, and its first ever.
-    Every version is an exact pin verified to resolve without substitution: no floating
-    value, no range and no wildcard, so a restore performed today and one performed in a
-    year consume identical inputs. The sibling application project declares no package at
-    all, which preserves the repository's dependency-free runtime posture.
-  -->
   <ItemGroup>
     <PackageReference Include="Microsoft.NET.Test.Sdk" Version="18.8.1" />
     <PackageReference Include="xunit" Version="2.9.3" />
@@ -72,22 +14,10 @@
     <PackageReference Include="coverlet.collector" Version="10.0.1" />
   </ItemGroup>
 
-  <!--
-    The sole project-reference edge in this repository, and strictly internal to it: two
-    levels up to the repository root, then down into the application project. Forward
-    slashes are used deliberately and MSBuild normalizes them per platform. No reference
-    crosses a submodule boundary in either direction, and there is no aggregate
-    cross-repository solution.
-  -->
   <ItemGroup>
     <ProjectReference Include="../../src/ChildRepo10Loc/ChildRepo10Loc.csproj" />
   </ItemGroup>
 
-  <!--
-    Project-wide global using for the test framework. This is what allows each test file
-    to declare its namespace and get straight to its facts without a framework import
-    directive of its own.
-  -->
   <ItemGroup>
     <Using Include="Xunit" />
   </ItemGroup>
