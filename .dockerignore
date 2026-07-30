@@ -1,0 +1,105 @@
+# .dockerignore - Docker build-context denylist for the Python health-endpoint
+# tier, which serves /health on port 8000.
+#
+# The sibling Dockerfile builds on python:3.14-slim, copies this tier's sources
+# and its declared configuration into /app, runs `python server.py`, and probes
+# itself with an inline `python -c` + urllib.request HEALTHCHECK. It installs
+# nothing: this composition runs on the standard library alone. Only what that
+# build genuinely needs may travel into the context. Everything listed below is
+# either local machine state, a build-time-only definition, or an artifact with
+# no purpose inside a running container.
+#
+# This is an EXPLICIT DENYLIST by design. Do not rewrite it as a catch-all "*"
+# followed by "!" re-inclusions: negation ordering is subtle, and one mis-ordered
+# line silently drops a file the image cannot run without.
+#
+# -----------------------------------------------------------------------------
+# NEVER ADD THESE. The first three break the build or start-up loudly. The last
+# two break nothing loudly, which is exactly what makes them the dangerous ones:
+#
+#   server.py         The container entry point (CMD ["python", "server.py"]).
+#   health.py         The payload builder and request handler; server.py imports
+#                     it, so its absence is an ImportError at start-up.
+#   app.py            Carries this tier's pre-existing greet() behaviour, which
+#                     the feature is required to preserve, and is imported by the
+#                     test suite.
+#   pyproject.toml    Supplies the DECLARED name and version. health.py reads it
+#                     once at import with tomllib, resolving the path from its
+#                     own module directory, and never raises on failure: it
+#                     records a degradation reason and serves the compiled-in
+#                     literals instead. If this file never reaches the context
+#                     the endpoint still answers 200 with a complete four-key
+#                     body, so the HEALTHCHECK goes green and CI passes while the
+#                     identity is no longer declared.
+#
+#                     Worse, and measured rather than assumed: the fallback
+#                     literals are the SAME strings this manifest declares
+#                     ("child_repo_10_LOC" and "1.0.0"), so the response body is
+#                     byte-identical either way. Reading /health therefore cannot
+#                     tell a declared identity from a fallback one. Only an
+#                     existence check inside the image, or the one-line
+#                     "health configuration degraded" notice server.py prints at
+#                     start-up, distinguishes them.
+#   config/health.json
+#                     Supplies the declared host, port and path, with the same
+#                     never-raises, fall-back-silently contract. The Dockerfile
+#                     must copy it PRESERVING the subdirectory
+#                     (COPY config/ ./config/).
+#
+#   For the same reasons, never write a broad pattern such as *.py, *.toml,
+#   *.json, **/*.json, config, config/ or .python-version: each of those would
+#   capture one of the files above.
+# -----------------------------------------------------------------------------
+
+# Version-control metadata. Excluding it is the single highest-value entry here.
+# In this repository .git is a one-line gitdir POINTER file, because this tier is
+# consumed as a submodule - so it contributes no history to the context, but it
+# does name a path inside the superproject's object store, and local
+# remote-tracking configuration must never be baked into an image layer.
+.git
+.gitmodules
+.gitignore
+
+# Python execution residue. Excluding this is FUNCTIONAL, not cosmetic: bytecode
+# written by a local `python server.py` or `python -m unittest` run is compiled
+# for whatever interpreter happened to be on the developer's machine, and a
+# stale cache entry arriving from the context can shadow a freshly copied
+# source - an image serving old behaviour from new sources. The plain and the
+# "**/" forms are both listed on purpose: in a .dockerignore a leading segment
+# without "**" matches only at the context root, so the second form is what
+# reaches config/ and any other subdirectory.
+__pycache__
+**/__pycache__
+*.pyc
+**/*.pyc
+
+# Local environment files. A machine-local .env must never be baked into an
+# image layer; the .env.* form generalizes that guarantee to every dotenv
+# variant (.env.local, .env.production) so a newly added one cannot slip in.
+# .env.example is a documentation template read from the repository, not a
+# runtime input, and is named explicitly here for the reader.
+.env
+.env.example
+.env.*
+
+# Documentation. Read from the repository, not from inside a container.
+README.md
+
+# Build-time-only container definitions. The daemon reads these from the context
+# before the build begins; a running container has no use for either.
+Dockerfile
+.dockerignore
+
+# Continuous-integration definition. Consumed by the CI service straight from
+# the repository, never from inside the image.
+.github
+
+# Test sources. The suite is exercised by CI and during development; a runtime
+# image ships neither the tests nor the servers they start on ephemeral ports.
+test_app.py
+
+# The nested Java tier. It is a first-class part of this project and a TRACKED
+# gitlink - it must never appear in .gitignore - but it builds its own image
+# from its own Dockerfile and serves its own endpoint on port 8080. Including it
+# here would ship unrelated Java sources inside this Python image.
+nested_child_repo_10_LOC
