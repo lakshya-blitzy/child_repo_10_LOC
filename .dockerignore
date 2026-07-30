@@ -1,41 +1,35 @@
 # Build-context denylist for the Python health-endpoint tier (port 8000).
 #
 # The sibling Dockerfile copies its runtime files by name, so this file does not
-# decide what lands in the image -- it decides what the daemon has to receive
-# before the build starts. Keep it an explicit denylist: a catch-all "*" with "!"
-# re-inclusions is harder to reason about, and one mis-ordered negation drops a
-# file silently.
+# decide what lands in the image -- it decides what the daemon has to receive before
+# the build starts. Kept an explicit denylist rather than a `*` with `!`
+# re-inclusions, where one mis-ordered negation drops a file silently.
 #
-# Never exclude pyproject.toml or config/health.json. health.py reads both at
-# import and falls back to compiled-in literals rather than raising, and those
-# literals are the same strings the manifest declares -- so an image built
-# without them serves a byte-identical body from fallbacks and no reading of
-# /health can tell the two apart. Only an existence check inside the image, or
-# the "health configuration degraded" line server.py prints at start-up, can. So
-# no broad *.py, *.toml, *.json, config or .python-version pattern.
+# Never exclude pyproject.toml or config/health.json: health.py falls back to
+# compiled-in literals carrying the same strings, so an image built without them
+# serves a byte-identical body and no reading of /health can tell the two apart --
+# only an existence check inside the image, or the "health configuration degraded"
+# line server.py prints at start-up. So no broad *.py, *.toml, *.json, config or
+# .python-version pattern.
 
-# Version-control metadata. Here .git is a one-line gitdir POINTER file, because
-# this tier is consumed as a submodule, so it carries no history -- but it does
-# name a path inside the superproject's object store, and local remote-tracking
-# configuration must never be baked into an image layer.
+# Version-control metadata. Here .git is a one-line gitdir POINTER file, because this
+# tier is consumed as a submodule, but it names a path inside the superproject's
+# object store and local remote-tracking configuration must never enter a layer.
 .git
 .gitmodules
 .gitignore
 
-# Python execution residue from a local run. These files are machine-specific
-# and are pure build-context weight: the Dockerfile copies named .py files and
-# config/ only, so they could not reach the image in any case (and
-# PYTHONDONTWRITEBYTECODE=1 keeps the container from writing its own). The plain
-# and "**/" forms are both listed because a leading segment without "**" matches
-# at the context root only, so the second form is what reaches config/.
+# Python execution residue from a local run: machine-specific, and pure
+# build-context weight. The Dockerfile copies named .py files and config/ only, so
+# these could not reach the image in any case. The plain and `**/` forms are both
+# listed because a leading segment without `**` matches at the context root only.
 __pycache__
 **/__pycache__
 *.pyc
 **/*.pyc
 
-# Local environment files. A machine-local .env must never enter an image layer;
-# the .env.* form generalizes that to every dotenv variant. .env.example is a
-# documentation template and is named explicitly for the reader.
+# Local environment files; .env.example is the tracked documentation template and is
+# named explicitly for the reader.
 .env
 .env.example
 .env.*
@@ -43,20 +37,19 @@ __pycache__
 # Documentation. Read from the repository, not from inside a container.
 README.md
 
-# Build-time-only container definitions: read from the context before the build,
-# useless inside a running container.
+# Build-time-only inputs, read from the context before the build.
 Dockerfile
 .dockerignore
 
-# A .github directory, whenever one is added. Anything under it is read from the
-# repository rather than from inside an image, so it never belongs in a context.
+# A .github directory, whenever one is added: read from the repository, never from
+# inside an image.
 .github
 
-# Test sources. A runtime image ships neither the tests nor the servers they
-# start on ephemeral ports.
+# Test sources. A runtime image ships neither the tests nor the servers they start on
+# ephemeral ports.
 test_app.py
 
 # The nested Java tier. It is a first-class part of this project and a TRACKED
-# gitlink -- it must never appear in .gitignore -- but it builds its own image
-# from its own Dockerfile and serves its own endpoint on port 8080.
+# gitlink -- it must never appear in .gitignore -- but it builds its own image from
+# its own Dockerfile and serves its own endpoint on port 8080.
 nested_child_repo_10_LOC

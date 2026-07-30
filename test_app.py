@@ -44,26 +44,18 @@ Five things are asserted, and they carry equal weight.
    connection rather than desynchronize it -- while leaving the listener serving
    the next caller.
 
-The contract, spelled out as the request/response matrix this suite asserts::
+The contract itself is defined normatively in ``docs/health-endpoint.md`` in the
+apex repository.  The values this suite spells out as independent literals -- the
+reason for the first design decision below -- are this tier's identity and the
+frozen members::
 
-    GET|HEAD /health      -> 200, four-member body, in this order:
-                             name, version, timestamp, status
-    GET      /health?x=1  -> 200, identical (the query string is ignored)
-    GET      /health/     -> 404 (the path comparison is exact)
-    GET      /%68ealth    -> 404 (the target is never percent-decoded)
-    GET      ///health    -> 404 (a run of slashes is never collapsed)
-    GET      /./health    -> 404 (a dot segment is never resolved)
-    GET      /unknown     -> 404, small JSON error body
-    POST     /health      -> 405 + Allow: GET, HEAD
-    POST     <any>        -> 405, body unread, connection closed
-
-    Content-Type:  application/json; charset=utf-8
-    Cache-Control: no-store
     name:          child_repo_10_LOC          (this tier's identifier)
     version:       1.0.0
-    timestamp:     YYYY-MM-DDTHH:MM:SS.mmmZ   (UTC, exactly 3 fractional
-                                               digits, per request)
     status:        UP
+    timestamp:     YYYY-MM-DDTHH:MM:SS.mmmZ   (UTC, exactly 3 fractional
+                                               digits, read per request)
+    Content-Type:  application/json; charset=utf-8
+    Cache-Control: no-store
     Serialization: compact separators, no insignificant whitespace
 
 Two clauses of that contract are asserted here in more depth than a single
@@ -549,11 +541,11 @@ REFUSED_BODY_BYTES = 1 << 20
 #: Wall-clock ceiling for a refusal, and the reason the refusal assertions time
 #: themselves at all.
 #:
-#: The handler's idle timeout is ten seconds, so an implementation that consumed a
-#: refused body -- or waited for one that never arrives -- would take up to that
-#: long.  Measured on the reference host the refusal costs **0.3-0.9 ms** whatever
-#: the declared length, so one second sits three orders of magnitude above the
-#: healthy cost and an order of magnitude below the cheapest expression of the
+#: An implementation that consumed a refused body -- or waited for one that never
+#: arrives -- would take the handler's whole idle timeout
+#: (:attr:`health.HealthRequestHandler.timeout`).  A correct refusal costs well
+#: under a millisecond whatever the declared length, so one second sits orders of
+#: magnitude above the healthy cost and well below the cheapest expression of the
 #: defect: a budget that cannot fail by accident and cannot pass by accident.
 REFUSAL_BUDGET_SECONDS = 1.0
 
@@ -605,11 +597,11 @@ BACKLOG_BURST_CONNECTIONS = 40
 #: close it.  Derived, not guessed: a refusal costs one failed semaphore
 #: acquisition -- bounded by ``server.ADMISSION_WAIT_SECONDS``, which is 25 ms --
 #: plus a socket shutdown.  One second therefore leaves well over an order of
-#: magnitude of headroom while sitting far below the ten-second handler idle
-#: timeout, which is how long an *admitted* but silent connection would occupy its
-#: permit.  That gap is the whole point: it is what distinguishes "refused now"
-#: from "accepted and waiting", so a bound that failed to apply could not pass this
-#: budget by accident -- it would spend ten seconds proving it.
+#: magnitude of headroom while sitting far below the handler idle timeout, which is
+#: how long an *admitted* but silent connection would occupy its permit.  That gap
+#: is the whole point: it is what distinguishes "refused now" from "accepted and
+#: waiting", so a bound that failed to apply could not pass this budget by
+#: accident -- it would spend the whole idle timeout proving it.
 ADMISSION_REFUSAL_BUDGET_SECONDS = 1.0
 
 #: Connections opened in sequence by the permit-recycling assertion, as a multiple
@@ -4351,11 +4343,10 @@ class TestHealthEndpointOverHttp(PayloadContractAssertions, unittest.TestCase):
 
         A large ``Content-Length`` is declared and **nothing** is sent after the
         header block.  An implementation that consumed a refused body would sit
-        here until the handler's ten-second idle timeout expired, so the wall
-        clock is the assertion: the measured refusal costs well under a
-        millisecond, and the budget sits an order of magnitude below the cheapest
-        expression of the defect.  It is the promptness, not merely the status
-        code, that proves nothing was read.
+        here until the handler's idle timeout expired, so the elapsed time is the
+        assertion: a correct refusal costs well under a millisecond and the budget
+        sits far below the cheapest expression of the defect.  It is the
+        promptness, not merely the status code, that proves nothing was read.
         """
         connection = self._raw()
         self.addCleanup(connection.close)
@@ -5615,12 +5606,11 @@ class TestServerListenerLifecycle(PayloadContractAssertions, unittest.TestCase):
         """The backlog passed to ``listen()`` is the operating system's ceiling.
 
         ``socketserver`` defaults ``request_queue_size`` to 5, and a resource whose
-        entire purpose is to be polled cannot afford that: once the queue
-        overflows, the kernel discards the handshake and the client waits out a
-        retransmission timeout -- measured at ~1004 ms inside ``connect()`` for
-        half of 40 simultaneous clients, while the exchanges themselves took ~2 ms.
-        A probe with a one-second timeout would have called this endpoint *down*
-        while it was answering everything it received in single-digit milliseconds.
+        entire purpose is to be polled cannot afford that: once the queue overflows
+        the kernel discards the handshake and the client waits out a retransmission
+        timeout, which is orders of magnitude longer than the exchange itself.  A
+        probe with a short timeout would then call this endpoint *down* while it was
+        answering everything it actually received.
 
         Asserted as an equality against ``socket.SOMAXCONN`` rather than a
         ``>=`` bound so that a regression to the standard library's default cannot
@@ -5980,8 +5970,8 @@ class TestBoundedAdmission(PayloadContractAssertions, unittest.TestCase):
     """Concurrency is bounded, and what happens at the bound is defined.
 
     ``ThreadingMixIn`` on its own starts one thread per accepted connection with
-    no ceiling of any kind, and this tier's handler holds a connection for up to
-    its ten-second idle timeout.  A burst of clients that connect and then say
+    no ceiling of any kind, and this tier's handler holds a connection for the whole
+    of its idle timeout.  A burst of clients that connect and then say
     nothing is therefore enough, unbounded, to convert stalled peers into
     unbounded threads and exhaust the process -- a liveness endpoint that stops
     answering while nothing whatsoever is wrong with what it answers.  A bound is

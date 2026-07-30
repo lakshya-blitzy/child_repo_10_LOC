@@ -48,18 +48,10 @@ here and *reported* by the entry point.  The single exception is
 internal-defect category and can only fire while a request is being served --
 never at import.
 
-The frozen response contract -- normative source ``docs/health-endpoint.md`` in
-the apex repository, implemented identically by the JavaScript tier's
-``health.js`` and the Java tier's ``HealthServer.java``::
-
-    GET|HEAD /health      -> 200, the four-member body
-    GET      /health?x=1  -> 200, identical (the query string is ignored)
-    GET      /health/     -> 404 (the path comparison is exact; no normalizing)
-    GET      /%68ealth    -> 404 (the target is never percent-decoded)
-    GET      ///health    -> 404 (a run of slashes is never collapsed)
-    GET      /./health    -> 404 (a dot segment is never resolved)
-    GET      /unknown     -> 404 {"error":"Not Found"}
-    POST     <any path>   -> 405 {"error":"Method Not Allowed"} + Allow: GET, HEAD
+The frozen response contract is defined normatively in ``docs/health-endpoint.md``
+in the apex repository -- read it there rather than from a restatement here -- and
+is implemented identically by the JavaScript tier's ``health.js`` and the Java
+tier's ``HealthServer.java``.
 
 Two values in that contract are **validated settings rather than free ones**:
 the resource path ``/health`` and the ``status`` literal ``UP``.  Both are read
@@ -82,16 +74,14 @@ that answers ``200``.
     Cache-Control: no-store
     Body:          {"name":...,"version":...,"timestamp":...,"status":"UP"}
 
-Two clauses of that contract are byte-level requirements, both measured rather
-than assumed, and both are the reason for an argument that looks cosmetic:
+Two clauses of that contract are byte-level requirements, and both are the reason
+for an argument that looks cosmetic:
 
 1. ``json.dumps`` defaults to ``", "``/``": "`` separators, which diverges
-   byte-for-byte from the sibling applications' compact output.  Every
-   serialization here therefore passes ``separators=(",", ":")``.  Over the
-   canonical field values: compact md5 ``7b23468a1b5d1c6518c47d9e87778edb``
-   versus default-separator md5 ``d32e3993d1e52c7a5caad222a75cc437``.
-2. ``datetime.isoformat()`` emits six fractional digits and a ``+00:00``
-   offset, failing the contract's timestamp pattern
+   byte-for-byte from the sibling applications' compact output, so every
+   serialization here passes ``separators=(",", ":")``.
+2. ``datetime.isoformat()`` emits six fractional digits and a ``+00:00`` offset,
+   failing the contract's timestamp pattern
    ``^\\d{4}-\\d{2}-\\d{2}T\\d{2}:\\d{2}:\\d{2}\\.\\d{3}Z$``.  The timestamp is
    formatted explicitly to three fractional digits with a ``Z`` suffix, from a
    single clock read.
@@ -1188,17 +1178,13 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     #: persistent connection and never completes a request would hold a worker
     #: thread for the life of the process.
     #:
-    #: Five seconds, because this is one half of a pair and the other half is a
+    #: Five seconds, because this is one half of a pair whose other half is a
     #: *bounded* pool.  The listener serves connections on a fixed number of
     #: reusable workers (:attr:`server.HealthHTTPServer.worker_threads`), so a
     #: worker is a rationed resource and this value is how long one connection may
-    #: ration it while sending nothing at all.  Ten seconds was generous against
-    #: an unbounded thread-per-connection listener, where an idle connection cost
-    #: only its own thread; against a pool it is twice as long as anything needs
-    #: to hold a slot.  The measurements this endpoint is built on put a probe at
-    #: ~0.1 ms of work and a keep-alive round trip at ~0.5 ms, so five seconds is
-    #: still four orders of magnitude of headroom for the slowest legitimate
-    #: client, while halving the worst case a stalled one can impose.
+    #: ration it while sending nothing at all.  It leaves ample headroom for the
+    #: slowest legitimate client -- a probe exchanges one small request and one
+    #: small response -- while bounding the worst case a stalled one can impose.
     #:
     #: It is also the ceiling on how long a persistent connection can delay the
     #: *last* reply after a shutdown, which is why the listener sets

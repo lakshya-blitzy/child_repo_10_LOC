@@ -141,24 +141,24 @@ EXIT_SHUTDOWN_FAILURE = 2
 #: Accepted connections this listener will serve at once.
 #:
 #: A bound is mandatory rather than a refinement, and the reason is the handler's
-#: own idle timeout: this tier speaks HTTP/1.1 with a ten-second idle timeout per
-#: connection, so a client that connects and then stalls occupies a thread for up
-#: to ten seconds while doing nothing.  Unbounded admission converts a burst of
-#: such clients directly into unbounded threads -- each with its own stack and
-#: file descriptor -- and the first symptom is not a slow endpoint but a process
-#: that cannot allocate a thread at all.  A liveness endpoint failing that way is
-#: the worst outcome available: it stops answering while nothing is wrong with
-#: what it answers.  ``daemon_threads`` and a deep accept queue do not help here;
-#: neither caps *work*, they only decide who waits and who is reaped.
+#: own idle timeout: this tier speaks HTTP/1.1 with a per-connection idle timeout
+#: (:attr:`health.HealthRequestHandler.timeout`), so a client that connects and
+#: then stalls occupies a thread for the whole of it while doing nothing.
+#: Unbounded admission converts a burst of such clients directly into unbounded
+#: threads -- each with its own stack and file descriptor -- and the first symptom
+#: is not a slow endpoint but a process that cannot allocate a thread at all.  A
+#: liveness endpoint failing that way is the worst outcome available: it stops
+#: answering while nothing is wrong with what it answers.  ``daemon_threads`` and a
+#: deep accept queue do not help; neither caps *work*, they only decide who waits
+#: and who is reaped.
 #:
-#: The value is chosen against the burst this tier is actually measured under.
-#: The accept-queue assertion in the sibling test suite opens **40** simultaneous
-#: connections and requires every one of them to be answered, so a cap at or
-#: below that number would throttle a poll burst this endpoint is expected to
-#: absorb.  Sixty-four sits above it with headroom while still bounding the
-#: process to a commitment it can always meet.  It is a class attribute, so a
-#: subclass -- a test, or a deployment with a different profile -- may lower or
-#: raise it without editing this module.
+#: The value must sit above the largest burst this endpoint is expected to absorb:
+#: the accept-queue assertion in the sibling test suite opens **40** simultaneous
+#: connections and requires every one to be answered, so a cap at or below that
+#: number would throttle a legitimate poll burst.  Sixty-four sits above it with
+#: headroom while still bounding the process to a commitment it can always meet.
+#: It is a class attribute, so a subclass -- a test, or a deployment with a
+#: different profile -- may lower or raise it without editing this module.
 MAX_CONCURRENT_REQUESTS = 64
 
 #: How long the accept loop waits for a permit before refusing the connection.
@@ -174,18 +174,14 @@ MAX_CONCURRENT_REQUESTS = 64
 #: at a fixed rate while everyone behind them queued in the kernel with no signal
 #: at all.  A refused caller can retry at once; a queued caller can only wait.
 #:
-#: Twenty-five milliseconds is derived from measurement.  Sixty-four simultaneous
-#: exchanges against this listener complete in 19-30 ms end to end -- a permit
-#: freed every 0.3-0.5 ms, with the slowest single exchange at ~13 ms -- so this
-#: wait is roughly two of the slowest requests and fifty of the average ones, and
-#: a healthy micro-burst just above the ceiling is absorbed without a refusal.
-#: What it deliberately does *not* absorb is the pathological case: a client that
-#: connects and stalls holds its permit for up to the handler's ten-second idle
-#: timeout, which no admission wait could ever wait out, so it is refused after
-#: 25 ms rather than after half a second.  The accept loop is therefore never
-#: stalled for more than 25 ms per refused connection, and a probe arriving during
-#: genuine saturation gets a definite answer -- a closed connection -- far inside
-#: its own three-second timeout.
+#: Twenty-five milliseconds is several times the cost of a whole exchange against
+#: this listener, so a healthy micro-burst just above the ceiling is absorbed
+#: without a refusal.  What it deliberately does *not* absorb is the pathological
+#: case: a client that connects and stalls holds its permit for the handler's whole
+#: idle timeout, which no admission wait could ever wait out, so it is refused
+#: quickly instead.  The accept loop is therefore never stalled for more than this
+#: wait per refused connection, and a probe arriving during genuine saturation gets
+#: a definite answer -- a closed connection -- far inside its own timeout.
 ADMISSION_WAIT_SECONDS = 0.025
 
 #: How long :meth:`~socketserver.BaseServer.serve_forever` waits between checks
@@ -452,25 +448,20 @@ class HealthHTTPServer(ThreadingHTTPServer):
     for a resource whose whole job is to keep answering.  Each connection costs a
     thread, a stack and a descriptor for as long as it is held, and because the
     handler speaks HTTP/1.1 a client that says nothing at all still holds one for
-    the full ten-second idle timeout, so a caller can turn stalled peers into
+    the whole idle timeout, so a caller can turn stalled peers into
     unbounded threads and eventually meet ``RuntimeError: can't start new
     thread`` -- at which point the accept loop stops serving *everyone*.
 
     So :meth:`process_request` admits at most :attr:`max_concurrent_requests`
     connections at a time and applies explicit back-pressure beyond that:
     :attr:`admission_wait_seconds` of waiting, then an immediate refusal -- closed
-    with no response written, and counted.  Three properties follow, and each is
-    the reason for the shape.  *Thread count is a property of this class, not of
-    the caller*, because the ceiling is a fixed number this class owns.  *Overload
-    is bounded and honest*, because the newest arrival is closed at once, which a
-    client reads as a reset it can retry rather than a timeout it must wait out;
-    running the overflow on the caller's thread is deliberately rejected here,
-    since that caller *is* the accept loop.  *Shutdown stays as prompt as it was*,
-    because nothing in the stop path waits on an in-flight reply -- see
-    ``block_on_close`` below, whose contract this preserves exactly.  The Java
-    tier of this composition makes the same choice with a fixed pool over a
-    bounded queue and an explicit rejection policy; the mechanism differs because
-    the runtimes do, the guarantee does not.
+    with no response written, and counted.  Thread count therefore belongs to this
+    class rather than to the caller; overload closes the newest arrival at once,
+    which a client reads as a retryable reset rather than a timeout it must wait
+    out; and shutdown stays as prompt as it was, because nothing in the stop path
+    waits on an in-flight reply (see ``block_on_close`` below).  Running the
+    overflow on the caller's thread is deliberately rejected here, because that
+    caller *is* the accept loop.
 
     All five inherited ``socketserver`` class attributes are set explicitly
     because each is load-bearing:
@@ -483,7 +474,7 @@ class HealthHTTPServer(ThreadingHTTPServer):
     ``block_on_close = False``
         Keeps shutdown prompt.  With ``True``, ``server_close`` joins in-flight
         request threads, so one keep-alive client could stall it for the handler's
-        full ten-second idle timeout -- long enough for a supervisor to read as a
+        whole idle timeout -- long enough for a supervisor to read as a
         hang and ``SIGKILL``.  Little is lost: the only interruptible work is a
         reply to a caller already told the process is going away.
 
@@ -620,7 +611,7 @@ class HealthHTTPServer(ThreadingHTTPServer):
           is involved, so running the rejected work inline costs microseconds of
           payload building.  Here the accept loop hands over a *raw socket*:
           running it inline would mean conducting the entire HTTP conversation on
-          the accept thread, including waiting up to the handler's ten-second idle
+          the accept thread, including waiting out the handler's whole idle
           timeout for a client that may never speak.  One stalled client would then
           stop the listener accepting at all -- precisely the failure the bound
           exists to prevent.
