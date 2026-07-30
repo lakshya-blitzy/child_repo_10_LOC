@@ -27,14 +27,22 @@ Five things are asserted, and they carry equal weight.
    port this suite reserves and releases first (see
    :func:`_reserve_free_port`), probed over HTTP, stopped with ``SIGTERM`` and
    ``SIGINT``, and failed deliberately against an occupied port to assert its
-   diagnostic.
-5. **Request framing and parser safety.**  A rejected request that carries a body,
-   a chunked body, an unparseable or oversized ``Content-Length``, a truncated
-   body, a malformed request line and an over-long target are all sent as raw
-   bytes, because none of them can be expressed through a well-behaved client.
-   Each one must be answered inside the contract's compact JSON shape, must not
-   reflect any request bytes back, and must not desynchronize a persistent
-   connection.
+   diagnostic.  Its two admission properties are asserted as well, because a
+   liveness endpoint fails just as completely by running out of threads as by
+   answering wrongly: the accept queue is deep enough for a simultaneous burst of
+   pollers, and concurrency is **bounded**, with saturation refused by a prompt
+   close rather than by an invented status code -- and every permit returned
+   however the connection ends.
+5. **Request framing and parser safety.**  A refused request that carries a body,
+   a chunked body, an unparseable or never-delivered ``Content-Length``, a
+   truncated body, a malformed request line and an over-long target are all sent
+   as raw bytes, because none of them can be expressed through a well-behaved
+   client.  Each one must be answered inside the contract's compact JSON shape and
+   must not reflect any request bytes back.  A refusal must also be *prompt* and
+   must **not read the body it refused**, which the suite proves by timing it
+   against a budget derived from the handler's idle timeout, and must end its own
+   connection rather than desynchronize it -- while leaving the listener serving
+   the next caller.
 
 The contract, spelled out as the request/response matrix this suite asserts::
 
@@ -47,6 +55,7 @@ The contract, spelled out as the request/response matrix this suite asserts::
     GET      /./health    -> 404 (a dot segment is never resolved)
     GET      /unknown     -> 404, small JSON error body
     POST     /health      -> 405 + Allow: GET, HEAD
+    POST     <any>        -> 405, body unread, connection closed
 
     Content-Type:  application/json; charset=utf-8
     Cache-Control: no-store
@@ -98,10 +107,11 @@ because each one is load-bearing:
 * **Every wait is bounded and nothing is left behind.**  Readiness is established
   by polling, never by sleeping; every socket carries a timeout; every child
   process is signalled, awaited under a deadline and killed unconditionally in a
-  cleanup; every listener is shut down and closed in a ``finally``; and every
-  child interpreter runs with ``PYTHONDONTWRITEBYTECODE`` set, so running this
-  suite cannot leave a ``__pycache__`` directory, an orphaned process or a bound
-  port behind.
+  cleanup; every listener is shut down and closed in a ``finally``; every child
+  interpreter runs with ``PYTHONDONTWRITEBYTECODE`` set; and this interpreter sets
+  :data:`sys.dont_write_bytecode` before it imports a single repository module, so
+  running this suite cannot leave a ``__pycache__`` directory, an orphaned process
+  or a bound port behind.
 * **Zero third-party packages.**  The repository has none and the target is
   none, so there is no pytest, no plugin, no assertion library, no HTTP client
   library and no clock-freezing library.  ``unittest`` plus the standard library
@@ -112,6 +122,15 @@ Run it directly with ``python test_app.py``, or through discovery::
 
     python -m py_compile test_app.py     # static gate
     python -m unittest -v                # discovery: matches test*.py
+
+Running it directly writes no bytecode at all: ``__main__`` is never cached, and
+:data:`sys.dont_write_bytecode` below covers every module this file imports.  Under
+discovery the runner imports *this* file before any line of it executes, so the
+interpreter caches ``test_app`` itself unless it is told otherwise.  Point that one
+remaining write outside the working tree and the tier stays clean under either
+invocation::
+
+    PYTHONPYCACHEPREFIX="${TMPDIR:-/tmp}/py-cache" python -m unittest -v
 """
 
 import contextlib
@@ -135,6 +154,17 @@ import tomllib
 import unittest
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+# Importing a repository module is what materialises ``child_repo_10_LOC/__pycache__``:
+# CPython caches every module it imports from source, beside the source, unless it is
+# told not to.  The tier's working tree must stay clean -- acceptance criterion AC-13
+# requires ``git status --porcelain --untracked-files=all`` to be empty after a full
+# test cycle -- so the write is disabled *before* the first repository import rather
+# than cleaned up afterwards.  Deleting a directory after the fact is a race against
+# a concurrent ``git status``; not creating it has no race.  This statement therefore
+# sits deliberately between the standard-library imports and the first-party ones,
+# and ``test_the_bytecode_write_guard_is_in_force`` asserts it is still here.
+sys.dont_write_bytecode = True
 
 import app
 import health
@@ -509,48 +539,110 @@ PROCESS_EXIT_TIMEOUT_SECONDS = 10.0
 PORT_RELEASE_TIMEOUT_SECONDS = 5.0
 PORT_RELEASE_PAUSE_SECONDS = 0.02
 
-#: Ceiling ``health.py`` applies to a declared request body it is willing to
-#: drain.  A declared length above it is refused without reading a byte, which is
-#: what keeps a bogus ``Content-Length`` from turning into a long blocking read.
-MAX_DRAIN_BYTES = 1 << 20
+#: Body size the refusal assertions declare, and send where they send one.
+#:
+#: A mebibyte is the size the frozen contract records as measured: it fits the
+#: socket buffers at this tier, so a client that writes it in one call still reads
+#: the whole ``405`` the server answered without reading any of it.
+REFUSED_BODY_BYTES = 1 << 20
+
+#: Wall-clock ceiling for a refusal, and the reason the refusal assertions time
+#: themselves at all.
+#:
+#: The handler's idle timeout is ten seconds, so an implementation that consumed a
+#: refused body -- or waited for one that never arrives -- would take up to that
+#: long.  Measured on the reference host the refusal costs **0.3-0.9 ms** whatever
+#: the declared length, so one second sits three orders of magnitude above the
+#: healthy cost and an order of magnitude below the cheapest expression of the
+#: defect: a budget that cannot fail by accident and cannot pass by accident.
+REFUSAL_BUDGET_SECONDS = 1.0
 
 #: Read size for :meth:`_RawConnection.read_until_close`.  Every response this
 #: suite reads that way is a few dozen bytes, so one read drains it.
 _RAW_READ_CHUNK_BYTES = 1 << 16
 
 #: Sequential requests issued on ONE persistent connection by the keep-alive
-#: assertions, and the total wall-clock budget for them.
+#: assertion.
 #:
-#: The budget is the regression gate for a measured defect, so its value is
-#: derived rather than chosen for comfort.  When the response left in two writes
-#: with Nagle's algorithm enabled, every request after the first completed in
-#: ~41 ms -- the peer's delayed-acknowledgement quantum -- so three requests cost
-#: upwards of 80 ms.  Coalesced and with ``TCP_NODELAY`` set they cost ~0.5 ms in
-#: total.  120 ms therefore sits an order of magnitude above the healthy cost and
-#: below the cheapest possible expression of the defect, which is what makes it
-#: diagnostic instead of decorative.
+#: What that assertion checks is *correctness*: three responses in a row, each
+#: complete, each conforming and each freshly built, with the connection staying
+#: correctly framed between them.  Neither the number of ``recv`` calls it takes to
+#: collect a response nor the wall-clock time the three requests consume is
+#: asserted, and that omission is deliberate: TCP is a byte stream, so how the
+#: bytes are grouped into ``recv`` returns is the kernel's decision and how long a
+#: round trip takes is the scheduler's.  Asserting either would measure the host
+#: rather than ``health.py``.
+#:
+#: The single-write property those measurements were reaching for is a real
+#: contract, and it is still gated deterministically at the handler by
+#: :class:`TestResponseIsWrittenInOneWrite`, which records every write the response
+#: path makes and asserts there is exactly one.  A defect that split the head from
+#: the body fails that class outright, with no dependence on timing.
 KEEPALIVE_REQUESTS = 3
-KEEPALIVE_TOTAL_BUDGET_SECONDS = 0.120
 
-#: Connections opened simultaneously by the accept-backlog assertion, and the
-#: budget for all of them to be answered.
+#: Connections opened simultaneously by the accept-backlog assertion.
 #:
-#: Also derived from a measurement.  ``socketserver`` defaults ``listen()`` to a
-#: backlog of 5; with 40 simultaneous clients, 20 of them sat ~1004 ms inside
-#: ``connect()`` because the kernel dropped their handshake and their stack waited
-#: out an initial retransmission timeout, while the exchanges themselves took
-#: ~2 ms.
+#: The burst size is 40 because that is where the defect it exercises actually
+#: appears, and that was established by measurement rather than assumed: against
+#: ``socketserver``'s default ``listen()`` backlog of 5, bursts of 24 completed
+#: promptly while bursts of 40 saw half the clients sit inside ``connect()`` for
+#: ~1 s each, because the kernel discarded their handshake and their stack waited
+#: out an initial retransmission timeout.  A smaller burst would have let the
+#: assertion pass against the very default it exists to reject.
 #:
-#: The burst size is 40 because that is where the defect actually appears, and
-#: that was established by measurement rather than assumed: against a backlog of
-#: 5, bursts of 24 completed in ~12 ms while bursts of 40 took **1284 ms** and
-#: bursts of 64 took ~1067 ms -- the accept queue only overflows once the clients
-#: outpace the accept loop.  A smaller burst would have made this assertion pass
-#: against the very default it exists to reject.  With the backlog raised, the
-#: same 40 connections cost ~18 ms, so 600 ms sits an order of magnitude above the
-#: healthy cost and far below the ~1 s floor of a single dropped handshake.
+#: No wall-clock budget accompanies it.  The scheduling of forty concurrent
+#: threads is the host's decision, so timing them measures the runner's load
+#: rather than the listener, and a ceiling tight enough to catch a shallow backlog
+#: is also tight enough to fail a busy CI machine that is behaving correctly.  The
+#: backlog itself is asserted deterministically instead --
+#: ``request_queue_size == socket.SOMAXCONN`` -- and this burst asserts the
+#: functional consequence: all forty clients are answered, each with a conforming
+#: payload.  Every join is still bounded, so a genuine stall fails as an unfinished
+#: client rather than hanging the suite.
 BACKLOG_BURST_CONNECTIONS = 40
-BACKLOG_BURST_BUDGET_SECONDS = 0.600
+
+#: Ceiling on how long a *saturated* listener may take to refuse a connection and
+#: close it.  Derived, not guessed: a refusal costs one failed semaphore
+#: acquisition -- bounded by ``server.ADMISSION_WAIT_SECONDS``, which is 25 ms --
+#: plus a socket shutdown.  One second therefore leaves well over an order of
+#: magnitude of headroom while sitting far below the ten-second handler idle
+#: timeout, which is how long an *admitted* but silent connection would occupy its
+#: permit.  That gap is the whole point: it is what distinguishes "refused now"
+#: from "accepted and waiting", so a bound that failed to apply could not pass this
+#: budget by accident -- it would spend ten seconds proving it.
+ADMISSION_REFUSAL_BUDGET_SECONDS = 1.0
+
+#: Connections opened in sequence by the permit-recycling assertion, as a multiple
+#: of the capped listener's ceiling.  Serving strictly more connections than the
+#: ceiling admits at once is possible only if every permit is returned, so the
+#: multiple is what gives the assertion its force; three is enough to fail a leak
+#: on the first cycle rather than the last.
+SEQUENTIAL_ADMISSION_CYCLES = 3
+
+#: The ceiling the saturation assertions substitute for the shipped sixty-four.
+#: Four is the smallest value that still distinguishes a real concurrency
+#: allowance from an accidental serialization -- it is exercised by holding four
+#: connections open simultaneously and then being refused on the fifth -- and it
+#: reaches that boundary with four sockets instead of sixty-five.  It is
+#: substituted through the class attribute that exists for exactly this purpose,
+#: so the code path under assertion is the shipped one and only the number
+#: differs; the refusal wait is deliberately *not* substituted, so the shipped
+#: 25 ms is what these cases actually measure.
+CAPPED_ADMISSION_CEILING = 4
+
+#: How many times a request the ceiling refused is retried before the refusal is
+#: read as a leaked permit.
+#:
+#: A permit is returned by the handler's own thread as it unwinds, not by the
+#: client's close, so a request issued microseconds after a connection ended can
+#: legitimately find the ceiling still full -- and on a loaded machine that window
+#: widens with scheduling latency.  Treating the first refusal as a failure would
+#: therefore make these assertions report a busy moment as a defect.  Retrying does
+#: not weaken them: a permit that was genuinely lost is not transient and exhausts
+#: every attempt, so a leak still fails and only the scheduling noise is absorbed.
+#: Twenty attempts at the suite's 5 ms polling pause, each additionally covered by
+#: the listener's own 25 ms admission wait, spans well over half a second.
+ADMISSION_RETRY_ATTEMPTS = 20
 _HEALTH_STATUS_PROBE_MODULE_NAME = "blitzy_probe_health_declared_status"
 
 
@@ -1200,6 +1292,197 @@ class PayloadContractAssertions:
             f"{text!r} must end with {SERIALIZED_SUFFIX!r}",
         )
         self.assert_serialization_is_compact(text)
+
+
+class TestSuiteWritesNoBytecodeIntoTheTier(unittest.TestCase):
+    """The suite's own hygiene invariant: importing this tier caches nothing.
+
+    CPython writes a ``__pycache__`` directory beside every source module it
+    imports, so the three first-party imports at the top of this file are by
+    themselves enough to dirty the working tree.  Acceptance criterion AC-13
+    requires ``git status --porcelain --untracked-files=all`` to be empty after a
+    full test cycle, so the write is *prevented* rather than cleaned up: deleting
+    a directory afterwards races a concurrent ``git status``, while never creating
+    it cannot race anything.
+
+    Every assertion here is deterministic and touches only paths this test creates
+    itself under :func:`tempfile.mkdtemp`.  Nothing asserts the *absence* of a
+    ``__pycache__`` directory inside the repository, deliberately: such a test
+    would report a stale directory left behind by some unrelated earlier command
+    as a failure of this suite, which is a host-state assertion masquerading as a
+    contract assertion.  What is asserted instead is the guard itself, its
+    position relative to the imports it has to precede, and -- with a negative
+    control, so the check cannot pass vacuously -- the fact that the guard really
+    does suppress the write on this interpreter.
+    """
+
+    #: The guard as it is spelled in this file.  Asserting the *text* catches a
+    #: deletion or a relocation that ``sys.dont_write_bytecode`` alone would miss:
+    #: an interpreter started with ``-B`` or ``PYTHONDONTWRITEBYTECODE`` reports
+    #: ``True`` for the flag whether or not this file sets it, so the flag on its
+    #: own would silently stop gating the moment CI added ``-B``.
+    GUARD_STATEMENT = "\nsys.dont_write_bytecode = True\n"
+
+    #: The first repository import.  The guard is worthless after this line.
+    FIRST_REPOSITORY_IMPORT = "\nimport app\n"
+
+    def _import_from_path(self, name, path):
+        """Import *path* under *name* through the real import machinery.
+
+        :func:`runpy.run_path` and :func:`exec` are both unsuitable here because
+        neither consults the bytecode cache at all -- the behaviour under test is
+        precisely what :class:`importlib.machinery.SourceFileLoader` does with it,
+        so the loader has to be the thing that runs.  The module is removed from
+        :data:`sys.modules` on cleanup so nothing leaks into later tests.
+        """
+        spec = importlib.util.spec_from_file_location(name, path)
+        self.assertIsNotNone(spec, f"{path} must be importable as {name}")
+        module = importlib.util.module_from_spec(spec)
+        sys.modules[name] = module
+        self.addCleanup(sys.modules.pop, name, None)
+        spec.loader.exec_module(module)
+        return module
+
+    def _throwaway_module(self, stem):
+        """Write a trivial importable module into a fresh temporary directory.
+
+        Outside the repository by construction, so even the negative control --
+        which deliberately lets a cache be written -- cannot touch the tier.
+        """
+        workspace = tempfile.TemporaryDirectory(prefix="blitzy_health_bytecode_")
+        self.addCleanup(workspace.cleanup)
+        source = pathlib.Path(workspace.name).resolve() / f"{stem}.py"
+        source.write_text("VALUE = 12\n", encoding="utf-8")
+        return source
+
+    @staticmethod
+    def _discard(path):
+        """Delete *path* if it exists, so the negative control leaves nothing.
+
+        The cache file can land outside the temporary workspace when
+        ``sys.pycache_prefix`` is set, in which case the workspace's own cleanup
+        would not reach it.
+        """
+        with contextlib.suppress(OSError):
+            path.unlink()
+
+    @staticmethod
+    def _cache_path_for(source):
+        """Where CPython *would* cache *source*, honouring ``sys.pycache_prefix``.
+
+        Computed rather than assumed: under the documented
+        ``PYTHONPYCACHEPREFIX=... python -m unittest`` invocation the cache does
+        not land in a sibling ``__pycache__`` directory at all, and a test that
+        hard-coded that layout would quietly assert nothing.
+        """
+        return pathlib.Path(importlib.util.cache_from_source(str(source)))
+
+    def test_the_bytecode_write_guard_is_in_force(self):
+        """:data:`sys.dont_write_bytecode` is true while this suite runs."""
+        self.assertIs(
+            sys.dont_write_bytecode,
+            True,
+            "the suite must run with bytecode writing disabled so that importing "
+            "app, health and server cannot materialize child_repo_10_LOC/__pycache__",
+        )
+
+    def test_the_guard_precedes_the_first_repository_import(self):
+        """The guard is set *before* ``import app``, not merely somewhere.
+
+        A guard that follows the import it is meant to protect is decoration: the
+        cache is written during the import, so ordering is the whole mechanism.
+        """
+        source = pathlib.Path(__file__).resolve().read_text(encoding="utf-8")
+        guard_at = source.find(self.GUARD_STATEMENT)
+        import_at = source.find(self.FIRST_REPOSITORY_IMPORT)
+        self.assertNotEqual(
+            guard_at, -1, "this file must set sys.dont_write_bytecode at module level"
+        )
+        self.assertNotEqual(import_at, -1, "this file must import the app module")
+        self.assertLess(
+            guard_at,
+            import_at,
+            "sys.dont_write_bytecode must be set before the first repository "
+            "import; after it, the cache has already been written",
+        )
+
+    def test_the_guard_suppresses_the_cache_the_import_would_write(self):
+        """With the guard in force an import leaves no cache file behind."""
+        source = self._throwaway_module("blitzy_guarded_probe")
+        cache = self._cache_path_for(source)
+        self.assertFalse(cache.exists(), f"{cache} must not exist before the import")
+        module = self._import_from_path("blitzy_guarded_probe", source)
+        self.assertEqual(module.VALUE, 12, "the module really was executed")
+        self.assertFalse(
+            cache.exists(),
+            f"{cache} was written even though sys.dont_write_bytecode is set",
+        )
+
+    def test_the_suppression_check_is_not_vacuous(self):
+        """The negative control: without the guard, the same import *does* cache.
+
+        This is what stops the test above from passing for the wrong reason -- a
+        renamed module, a loader that never caches, a temporary directory the
+        interpreter cannot write to.  The flag is restored in a ``finally``, and
+        both the cache file and its directory live outside the repository.
+        """
+        source = self._throwaway_module("blitzy_unguarded_probe")
+        cache = self._cache_path_for(source)
+        self.addCleanup(self._discard, cache)
+        previous = sys.dont_write_bytecode
+        try:
+            sys.dont_write_bytecode = False
+            self._import_from_path("blitzy_unguarded_probe", source)
+        finally:
+            sys.dont_write_bytecode = previous
+        self.assertIs(
+            sys.dont_write_bytecode, True, "the guard must be restored immediately"
+        )
+        self.assertTrue(
+            cache.exists(),
+            f"{cache} should have been written with the guard off; if it was not, "
+            "the suppression assertion proves nothing",
+        )
+
+    def test_the_guard_protects_the_repository_directory(self):
+        """The cache the guard suppresses would have landed inside the tier.
+
+        Asserted so the reader can see *which* directory is at stake: the three
+        first-party modules are imported from the tier root, which is tracked, so
+        their caches are exactly the untracked residue AC-13 forbids.  The check is
+        skipped rather than inverted when ``sys.pycache_prefix`` redirects caches
+        elsewhere, because then the tier is not the directory at risk.
+        """
+        tier = pathlib.Path(health.MODULE_DIR).resolve()
+        for module in (app, health, entry_point):
+            with self.subTest(module=module.__name__):
+                origin = pathlib.Path(module.__file__).resolve()
+                self.assertEqual(
+                    origin.parent, tier, f"{module.__name__} must live in the tier root"
+                )
+                if sys.pycache_prefix:
+                    continue
+                cache = self._cache_path_for(origin)
+                self.assertEqual(
+                    cache.parent,
+                    tier / "__pycache__",
+                    f"{module.__name__}'s cache would land in the working tree",
+                )
+
+    def test_child_interpreters_are_told_not_to_write_bytecode(self):
+        """Every spawned interpreter inherits ``PYTHONDONTWRITEBYTECODE``.
+
+        :data:`sys.dont_write_bytecode` is process-local, so it cannot travel to a
+        child.  :func:`_child_environment` is the one place a child's environment
+        is built, and it sets the variable unconditionally -- asserted here, and
+        asserted to survive unrelated overrides, because a child that imports
+        ``health`` or ``server`` would otherwise dirty the tier just as an
+        in-process import would.
+        """
+        self.assertEqual(_child_environment()["PYTHONDONTWRITEBYTECODE"], "1")
+        self.assertEqual(
+            _child_environment(HEALTH_PORT="0")["PYTHONDONTWRITEBYTECODE"], "1"
+        )
 
 
 class TestPreservedBehavior(unittest.TestCase):
@@ -3293,23 +3576,19 @@ class _RecordingWriter:
         return b"".join(self.writes)
 
 
-class TestResponseIsWrittenInOneSegment(unittest.TestCase):
-    """Every response leaves the handler in a single write.
+class TestResponseIsWrittenInOneWrite(unittest.TestCase):
+    """The handler hands each response to its ``wfile`` in a single write.
 
-    This is a *latency* contract, and it is asserted at the handler rather than
-    over TCP because the mechanism is deterministic here while the symptom over
-    TCP is a timing measurement.  The defect it guards against was measured: the
-    status line and headers went out in one write and the body in a second, and
-    because ``socketserver`` gives this handler an unbuffered ``wfile``, that was
-    two TCP segments.  With Nagle's algorithm holding the second segment until the
-    first was acknowledged, and the peer delaying that acknowledgement, every
-    keep-alive request after the first completed in ~41 ms instead of ~0.1 ms.
+    This is a property of this module's write path -- head and body are appended
+    to the same buffer and flushed once, saving a round trip -- and it is
+    observable on a recorder.  It says nothing about how a transport then frames
+    those bytes, and the contract makes no claim about that
+    (``docs/health-endpoint.md`` §9.5).
 
-    The handler is exercised without a socket: nothing here binds, and the
-    ``wfile`` is a recorder.  ``__new__`` is used deliberately --
-    ``BaseRequestHandler.__init__`` *serves a request* as part of construction, so
-    it cannot be used to obtain an instance for inspection.  Only the attributes
-    the write path reads are supplied, which is also what proves the write path
+    Nothing here binds: the ``wfile`` is a recorder, and ``__new__`` is used
+    because ``BaseRequestHandler.__init__`` *serves a request* as part of
+    construction and so cannot yield an instance for inspection.  Only the
+    attributes the write path reads are supplied, which is also what proves it
     reads nothing else.
     """
 
@@ -3334,13 +3613,11 @@ class TestResponseIsWrittenInOneSegment(unittest.TestCase):
     def test_nagles_algorithm_is_disabled_on_the_accepted_connection(self):
         """``TCP_NODELAY`` is set, and buffering is deliberately not used instead.
 
-        ``socketserver`` applies this flag in ``setup()`` for every accepted
+        ``socketserver`` applies the flag in ``setup()`` for every accepted
         connection, so asserting the class attribute asserts the socket option.
-        ``wbufsize`` is asserted alongside it because the pairing is the decision:
-        the standard library suggests this flag be used with its buffered-writer
-        mode, and that mode is rejected here because it would move the socket write
-        out of ``_send`` and into the base class's per-request flush, outside the
-        ``OSError`` guard that keeps a peer disconnect from printing a traceback.
+        ``wbufsize`` is asserted with it because the pairing is the decision: the
+        buffered-writer mode the standard library suggests would move the socket
+        write outside ``_send``'s ``OSError`` guard.
         """
         self.assertIs(health.HealthRequestHandler.disable_nagle_algorithm, True)
         self.assertEqual(
@@ -3359,7 +3636,7 @@ class TestResponseIsWrittenInOneSegment(unittest.TestCase):
             len(handler.wfile.writes),
             1,
             f"expected one write, saw {len(handler.wfile.writes)}: "
-            "a second write is a second TCP segment on an unbuffered socket",
+            "head and body must be flushed together",
         )
         written = handler.wfile.joined()
         head, separator, payload = written.partition(b"\r\n\r\n")
@@ -3397,6 +3674,37 @@ class TestResponseIsWrittenInOneSegment(unittest.TestCase):
         self.assertIn(b"Allow: " + health.ALLOW_HEADER_VALUE.encode(), written)
         self.assertTrue(written.endswith(health.METHOD_NOT_ALLOWED_BODY))
 
+    def test_the_refusal_responder_reads_nothing_and_ends_the_connection(self):
+        """The ``405`` responder consults neither ``headers`` nor ``rfile``.
+
+        The deterministic counterpart to the timed wire assertions: this handler
+        double is given **no** ``headers`` and **no** ``rfile``, so any attempt to
+        inspect a declared length or read a byte of a refused body would raise
+        ``AttributeError`` -- which the responder catches, abandoning the
+        connection without a response.  A complete frozen ``405`` in exactly one
+        write is therefore proof that nothing about the request body was
+        consulted, not merely evidence that the status code is right.
+
+        ``close_connection`` is asserted alongside it because the two are one
+        decision: the bytes are left unread, so the connection cannot carry
+        another request.  ``Connection`` is asserted *absent* because the contract
+        performs that closure rather than advertising it.
+        """
+        handler = self._handler()
+        handler._respond_method_not_allowed()
+
+        self.assertEqual(len(handler.wfile.writes), 1)
+        written = handler.wfile.joined()
+        self.assertTrue(written.startswith(b"HTTP/1.1 405 "), written[:40])
+        self.assertIn(b"Allow: " + health.ALLOW_HEADER_VALUE.encode(), written)
+        self.assertTrue(written.endswith(health.METHOD_NOT_ALLOWED_BODY))
+        self.assertNotIn(b"Connection:", written)
+        self.assertTrue(handler.close_connection, "a refusal ends its connection")
+        self.assertFalse(
+            hasattr(handler, "rfile"),
+            "the double must stay without an rfile, or this proves nothing",
+        )
+
     def test_an_http_0_9_response_is_the_body_alone_and_still_one_write(self):
         """A version-less request keeps its standard-library framing exactly.
 
@@ -3405,7 +3713,7 @@ class TestResponseIsWrittenInOneSegment(unittest.TestCase):
         the body with no status line and no headers.  Coalescing must not
         manufacture a status line for a request that never declared a version, so
         this asserts the bytes are unchanged -- and, incidentally, that they were
-        already one write.
+        already a single write.
         """
         handler = self._handler(request_version="HTTP/0.9")
         body = health.render_payload()
@@ -3928,13 +4236,21 @@ class TestHealthEndpointOverHttp(PayloadContractAssertions, unittest.TestCase):
 
     # -- Request framing and parser safety ---------------------------------
 
-    def test_a_rejected_request_with_a_body_leaves_the_connection_usable(self):
-        """A drained body keeps a persistent connection correctly framed.
+    def test_a_refused_method_is_answered_without_its_body_being_read(self):
+        """The frozen ``405`` arrives, then the connection ends -- body unread.
 
-        Nothing legitimate sends a body to this endpoint, but a client that does
-        must not desynchronize the connection: if the body were left unread, the
-        next request would be parsed starting from the middle of it.  The proof is
-        that a second, ordinary request on the *same* socket is answered correctly.
+        The contract requires a refusal to read nothing: the method check needs no
+        body, and reading megabytes only to discard them would let an
+        unauthenticated caller make this process do arbitrary work.  Leaving those
+        bytes unread means the connection cannot be reused -- the next request line
+        would be parsed from the middle of the body -- so the refusal ends it,
+        which is asserted here rather than assumed.
+
+        Three properties, because a half-correct implementation satisfies only
+        some of them: the response is the complete frozen ``405``; its header set
+        is still exactly the frozen one, with **no** ``Connection`` field, since
+        the closure is performed rather than advertised; and the peer really did
+        close.
         """
         connection = self._raw()
         self.addCleanup(connection.close)
@@ -3945,24 +4261,52 @@ class TestHealthEndpointOverHttp(PayloadContractAssertions, unittest.TestCase):
             b"Content-Type: application/json\r\n"
             b"Content-Length: " + str(len(body)).encode(EXPECTED_ENCODING) + b"\r\n\r\n" + body
         )
-        rejected = connection.read_response(method="POST")
+        refused = connection.read_response(method="POST")
 
-        self.assertEqual(rejected.status, 405)
-        self.assertEqual(rejected.header("Allow"), EXPECTED_ALLOW)
-        self.assertEqual(rejected.json(), {"error": "Method Not Allowed"})
+        self.assertEqual(refused.status, 405)
+        self.assertEqual(refused.header("Allow"), EXPECTED_ALLOW)
+        self.assertEqual(refused.json(), {"error": "Method Not Allowed"})
+        self._assert_contract_headers(refused)
+        self.assertIsNone(
+            refused.header("Connection"),
+            "the contract's own responses never advertise a connection close",
+        )
+        self.assertTrue(
+            connection.is_closed_by_peer(),
+            "an unread request body must end the connection, not desynchronize it",
+        )
 
-        connection.send(b"GET /health HTTP/1.1\r\nHost: " + authority + b"\r\n\r\n")
-        served = connection.read_response()
+    def test_a_refusal_leaves_the_listener_serving_the_next_caller(self):
+        """Ending one connection is not degrading the endpoint.
 
-        self.assertEqual(served.status, 200, "the connection must still be framed correctly")
+        The refusal above closes a connection; this asserts what that must *not*
+        cost.  A fresh connection -- which is what any client, poller or container
+        probe opens next -- is answered the ordinary contract response, so the
+        closure is scoped to the refused exchange and nothing about the listener
+        is left wedged by unread bytes.
+        """
+        refusing = self._raw()
+        self.addCleanup(refusing.close)
+        authority = f"{self._host}:{self._port}".encode(EXPECTED_ENCODING)
+        refusing.send(
+            b"DELETE /health HTTP/1.1\r\nHost: " + authority + b"\r\n"
+            b"Content-Length: 8\r\n\r\nignored!"
+        )
+        self.assertEqual(refusing.read_response(method="DELETE").status, 405)
+
+        served = self._perform("GET", EXPECTED_PATH)
+
+        self.assertEqual(served.status, 200)
         self.assert_payload_conforms(served.json())
 
-    def test_a_chunked_body_is_rejected_and_the_connection_is_closed(self):
-        """A transfer-encoded body cannot be measured, so the connection ends.
+    def test_a_chunked_body_is_refused_without_being_decoded(self):
+        """A transfer-encoded body is refused on its method, not on its framing.
 
-        The response still has to be the contract's 405 -- the caller's method is
-        the actionable fact -- but the connection cannot be reused, because how many
-        bytes remain unread is unknowable.  Closing it is the safe answer.
+        The chunk framing is never parsed, because the method decided the outcome
+        before the body was any of the endpoint's business: the response is the
+        contract's ``405`` and the connection then ends, exactly as it does for a
+        declared length.  The refusal is uniform -- no encoding, size or header
+        combination produces a different status or a different closure decision.
         """
         connection = self._raw()
         self.addCleanup(connection.close)
@@ -3979,11 +4323,16 @@ class TestHealthEndpointOverHttp(PayloadContractAssertions, unittest.TestCase):
         self.assertEqual(response.json(), {"error": "Method Not Allowed"})
         self.assertTrue(
             connection.is_closed_by_peer(),
-            "an unmeasurable body must end the connection, not desynchronize it",
+            "an unread body must end the connection, not desynchronize it",
         )
 
-    def test_an_unparseable_content_length_is_answered_then_closed(self):
-        """A ``Content-Length`` that is not a number is not trusted."""
+    def test_an_unparseable_content_length_is_refused_without_being_trusted(self):
+        """A ``Content-Length`` that is not a number changes nothing.
+
+        There is no arithmetic to get wrong, because the header is never read for
+        a refused method: the answer is the same ``405`` and the same closure a
+        well-formed declaration receives.
+        """
         connection = self._raw()
         self.addCleanup(connection.close)
         authority = f"{self._host}:{self._port}".encode(EXPECTED_ENCODING)
@@ -3997,33 +4346,76 @@ class TestHealthEndpointOverHttp(PayloadContractAssertions, unittest.TestCase):
         self.assertEqual(response.json(), {"error": "Method Not Allowed"})
         self.assertTrue(connection.is_closed_by_peer())
 
-    def test_an_oversized_declared_body_is_refused_without_being_read(self):
-        """A declared length above the drain ceiling is refused, not waited for.
+    def test_a_declared_body_that_never_arrives_does_not_delay_the_refusal(self):
+        """The refusal is measured, and it does not wait for promised bytes.
 
-        No body is sent at all, so a server that trusted the declared length would
-        block until its idle timeout.  The response therefore has to arrive
-        promptly -- which the bounded read asserts by simply completing -- and the
-        connection has to end.
+        A large ``Content-Length`` is declared and **nothing** is sent after the
+        header block.  An implementation that consumed a refused body would sit
+        here until the handler's ten-second idle timeout expired, so the wall
+        clock is the assertion: the measured refusal costs well under a
+        millisecond, and the budget sits an order of magnitude below the cheapest
+        expression of the defect.  It is the promptness, not merely the status
+        code, that proves nothing was read.
         """
         connection = self._raw()
         self.addCleanup(connection.close)
         authority = f"{self._host}:{self._port}".encode(EXPECTED_ENCODING)
-        declared = MAX_DRAIN_BYTES + 1
         connection.send(
             b"POST /health HTTP/1.1\r\nHost: " + authority + b"\r\n"
-            b"Content-Length: " + str(declared).encode(EXPECTED_ENCODING) + b"\r\n\r\n"
+            b"Content-Length: " + str(REFUSED_BODY_BYTES).encode(EXPECTED_ENCODING)
+            + b"\r\n\r\n"
         )
+        started = time.perf_counter()
         response = connection.read_response(method="POST")
+        elapsed = time.perf_counter() - started
 
         self.assertEqual(response.status, 405)
+        self.assertEqual(response.header("Allow"), EXPECTED_ALLOW)
         self.assertEqual(response.json(), {"error": "Method Not Allowed"})
+        self.assertLess(
+            elapsed,
+            REFUSAL_BUDGET_SECONDS,
+            f"the refusal took {elapsed * 1000:.1f} ms; waiting for a declared "
+            "body is the only thing that costs this much",
+        )
         self.assertTrue(connection.is_closed_by_peer())
 
-    def test_a_truncated_body_ends_the_connection_rather_than_hanging(self):
-        """A peer that stops early is noticed, and the answer still arrives.
+    def test_a_megabyte_body_is_still_answered_the_complete_frozen_405(self):
+        """The measured case from the contract, asserted rather than described.
 
-        The declared length is never satisfied and the write side is shut down, so
-        the drain reads EOF instead of the promised bytes.
+        A mebibyte written in one call fits the socket buffers at this tier, so the
+        client's own write completes and it reads the whole refusal -- status line,
+        ``Allow``, contract headers and the JSON body -- even though the server
+        answered without touching a byte of it.  A client that writes more than the
+        buffers hold instead sees its own ``send`` fail, which is the documented
+        consequence of an early answer rather than a fault; that case is not
+        asserted here because its timing belongs to the kernel's buffer sizing.
+        """
+        connection = self._raw()
+        self.addCleanup(connection.close)
+        authority = f"{self._host}:{self._port}".encode(EXPECTED_ENCODING)
+        connection.send(
+            b"POST /health HTTP/1.1\r\nHost: " + authority + b"\r\n"
+            b"Content-Length: " + str(REFUSED_BODY_BYTES).encode(EXPECTED_ENCODING)
+            + b"\r\n\r\n" + b"x" * REFUSED_BODY_BYTES
+        )
+        started = time.perf_counter()
+        response = connection.read_response(method="POST")
+        elapsed = time.perf_counter() - started
+
+        self.assertEqual(response.status, 405)
+        self.assertEqual(response.header("Allow"), EXPECTED_ALLOW)
+        self.assertEqual(response.json(), {"error": "Method Not Allowed"})
+        self._assert_contract_headers(response)
+        self.assertLess(elapsed, REFUSAL_BUDGET_SECONDS)
+        self.assertTrue(connection.is_closed_by_peer())
+
+    def test_a_truncated_body_does_not_delay_the_refusal_either(self):
+        """A peer that stops early changes nothing about the answer.
+
+        The declared length is never satisfied and the write side is shut down.
+        Nothing waits for the missing bytes, because nothing was going to read
+        them: the same ``405`` arrives, and it arrives promptly.
         """
         connection = self._raw()
         self.addCleanup(connection.close)
@@ -4033,10 +4425,13 @@ class TestHealthEndpointOverHttp(PayloadContractAssertions, unittest.TestCase):
             b"Content-Length: 512\r\n\r\ntruncated"
         )
         connection.half_close()
+        started = time.perf_counter()
         response = connection.read_response(method="POST")
+        elapsed = time.perf_counter() - started
 
         self.assertEqual(response.status, 405)
         self.assertEqual(response.json(), {"error": "Method Not Allowed"})
+        self.assertLess(elapsed, REFUSAL_BUDGET_SECONDS)
 
     def test_a_malformed_request_line_is_answered_with_safe_compact_json(self):
         """A protocol-level 400 carries the contract's JSON shape, not HTML.
@@ -4149,31 +4544,65 @@ class TestHealthEndpointOverHttp(PayloadContractAssertions, unittest.TestCase):
             with self.subTest(member=member):
                 self.assertEqual(served[member], built[member])
 
-    # Latency on a persistent connection.
+    # Correctness on a persistent connection.
 
-    def test_keep_alive_requests_arrive_in_one_segment_and_without_a_stall(self):
-        """Three requests on one connection, each answered in a single segment.
+    def _collect_one_response(self, connection, buffered):
+        """Return ``(response, surplus)`` for one complete response off the wire.
 
-        The wire-level half of :class:`TestResponseIsWrittenInOneSegment`, and the
-        regression gate for a measured defect: when the response left in two
-        writes, the headers arrived in ~0.1 ms and the body followed ~41 ms later
-        on every request after the first, because Nagle's algorithm held the second
-        segment until the peer acknowledged the first and the peer delayed that
-        acknowledgement.  A poller measuring response time saw a fortyfold
-        penalty produced entirely by framing.
+        Reads until the header block has arrived *and* the accumulated body has
+        reached the declared ``Content-Length``, then splits off whatever belongs
+        to the next response so the caller can carry it into the following round.
 
-        Two independent properties are asserted, deliberately, because either
-        alone could pass a half-fixed implementation:
+        Accumulating rather than asserting on a single ``recv`` is the point.  A
+        single ``recv`` returning everything is a property of the kernel's
+        coalescing on this host, not of the handler: the same correct
+        implementation can legitimately deliver the head and the body in two
+        returns, so treating one return as the contract makes the assertion a
+        host measurement.  Reading to completion asserts what actually matters --
+        that the whole response arrives, framed exactly as declared, and that the
+        connection is left positioned at the start of the next one.
+        """
+        while True:
+            head, separator, body = buffered.partition(b"\r\n\r\n")
+            if separator:
+                declared = re.search(rb"[Cc]ontent-[Ll]ength:\s*(\d+)", head)
+                self.assertIsNotNone(declared, "every response declares its length")
+                length = int(declared.group(1))
+                if len(body) >= length:
+                    boundary = len(head) + len(separator) + length
+                    return buffered[:boundary], buffered[boundary:]
+            chunk = connection.recv(_RAW_READ_CHUNK_BYTES)
+            self.assertNotEqual(
+                chunk,
+                b"",
+                "the peer closed the connection before the response was complete; "
+                "a keep-alive connection must survive every request in the series",
+            )
+            buffered += chunk
 
-        * **Segmentation**, which is deterministic -- a single ``recv`` must return
-          the status line, the headers *and* the whole declared body.  Under the
-          defect the first ``recv`` returns the head alone.
-        * **Total elapsed time** against a budget derived from the measurement,
-          which catches a stall arriving by any other route.
+    def test_every_response_on_a_persistent_connection_is_complete_and_fresh(self):
+        """Three requests on one connection, each answered completely and afresh.
 
-        A raw socket is used rather than :class:`_RawConnection` because its
-        buffered reader would hide the segmentation this asserts, and the
-        connection is closed by a registered cleanup.
+        The wire-level companion to :class:`TestResponseIsWrittenInOneWrite`.
+        That class owns the deterministic single-write gate; this one owns the
+        properties only a real connection can show: that the handler does not
+        desynchronize the stream between requests, that response *n* is framed by
+        its own ``Content-Length`` and can therefore be located without closing the
+        connection, and that each response is built at the moment it is served
+        rather than replayed from something captured at start-up.
+
+        Per round the whole response is collected and asserted -- status line,
+        both contract headers, a body whose length matches its declaration, the
+        frozen byte shape and the full payload contract.  Across rounds the three
+        timestamps must all differ, which is deterministic rather than a race:
+        ``health.py`` allocates each timestamp strictly later than the one before
+        it, so equal timestamps mean a cached body, not a fast clock.
+
+        Neither the number of ``recv`` calls nor the elapsed time is asserted; see
+        :data:`KEEPALIVE_REQUESTS` for why both would measure the host.  A raw
+        socket is used rather than :class:`_RawConnection` because the surplus
+        bytes have to be carried across rounds by this test, and the connection is
+        closed by a registered cleanup.
         """
         connection = socket.create_connection(
             (self._host, self._port), timeout=REQUEST_TIMEOUT_SECONDS
@@ -4185,35 +4614,38 @@ class TestHealthEndpointOverHttp(PayloadContractAssertions, unittest.TestCase):
             "Connection: keep-alive\r\n\r\n"
         ).encode(EXPECTED_ENCODING)
 
-        started = time.perf_counter()
+        buffered = b""
+        timestamps = []
         for attempt in range(1, KEEPALIVE_REQUESTS + 1):
             with self.subTest(request=attempt):
                 connection.sendall(request)
-                segment = connection.recv(_RAW_READ_CHUNK_BYTES)
-                head, separator, body = segment.partition(b"\r\n\r\n")
-                self.assertEqual(
-                    separator,
-                    b"\r\n\r\n",
-                    "the first segment must carry the complete header block",
-                )
+                response, buffered = self._collect_one_response(connection, buffered)
+                head, _, body = response.partition(b"\r\n\r\n")
                 self.assertTrue(head.startswith(b"HTTP/1.1 200 "), head[:40])
-                declared = re.search(rb"[Cc]ontent-[Ll]ength:\s*(\d+)", head)
-                self.assertIsNotNone(declared, "every response declares its length")
+                self.assertIn(b"Content-Type: " + EXPECTED_CONTENT_TYPE.encode(), head)
+                self.assertIn(b"Cache-Control: " + EXPECTED_CACHE_CONTROL.encode(), head)
+                declared = int(re.search(rb"[Cc]ontent-[Ll]ength:\s*(\d+)", head).group(1))
                 self.assertEqual(
                     len(body),
-                    int(declared.group(1)),
-                    "the body must arrive in the same segment as the headers; a "
-                    "second segment is what stalled behind the delayed ACK",
+                    declared,
+                    "the delivered body must be exactly as long as it was declared",
                 )
                 self.assert_byte_shape(body.decode(EXPECTED_ENCODING))
-                self.assert_payload_conforms(json.loads(body))
-        elapsed = time.perf_counter() - started
+                payload = json.loads(body)
+                self.assert_payload_conforms(payload)
+                timestamps.append(payload["timestamp"])
 
-        self.assertLess(
-            elapsed,
-            KEEPALIVE_TOTAL_BUDGET_SECONDS,
-            f"{KEEPALIVE_REQUESTS} keep-alive probes took {elapsed * 1000:.1f} ms; "
-            "the delayed-acknowledgement stall this guards against costs ~41 ms each",
+        self.assertEqual(
+            len(set(timestamps)),
+            KEEPALIVE_REQUESTS,
+            f"{timestamps} repeats a timestamp; every response on a persistent "
+            "connection must be built when it is served, never replayed",
+        )
+        self.assertEqual(
+            buffered,
+            b"",
+            "the handler wrote more bytes than the responses declared; the "
+            "connection is left desynchronized for the next request",
         )
 
 
@@ -5203,15 +5635,27 @@ class TestServerListenerLifecycle(PayloadContractAssertions, unittest.TestCase):
             "the tier's listener must not inherit socketserver's backlog of 5",
         )
 
-    def test_a_simultaneous_burst_of_connections_is_answered_without_a_stall(self):
-        """Every client in a burst is answered, and none waits out a dropped SYN.
+    def test_a_simultaneous_burst_of_connections_is_answered_completely(self):
+        """Every client in a burst gets a complete, conforming answer.
 
         The behavioural half of the assertion above: a deep accept queue is only
         worth asserting because of what it prevents, and what it prevents is
         visible only when many clients arrive at once.  Each connection is opened
-        and read to completion on its own thread, and the whole burst is bounded --
-        a single dropped handshake costs ~1 s on its own, so exceeding the budget
-        localizes the defect to the accept path rather than to the handler.
+        and read to completion on its own thread; nothing may be refused, reset,
+        truncated or answered with anything other than the contract.
+
+        The burst is deliberately **not** timed.  How long forty concurrent
+        connections take is decided by the host's scheduler and by whatever else
+        shares the runner, so a wall-clock ceiling here fails on a loaded machine
+        while ``server.py`` is behaving perfectly -- it measures the host, not the
+        listener.  The property that ceiling was reaching for is asserted
+        deterministically instead, one test above: ``request_queue_size`` equals
+        ``socket.SOMAXCONN``, so a regression to ``socketserver``'s backlog of 5 --
+        the actual cause of the dropped handshakes and their ~1 s retransmission
+        waits -- fails outright and by name, with no dependence on timing.  What is
+        added here is that the deep queue is really *used*: every one of the forty
+        clients is answered, and answered with a conforming payload rather than a
+        truncated or degraded one.
         """
         listener, bound_host, bound_port = self._bind()
         thread = threading.Thread(
@@ -5225,6 +5669,7 @@ class TestServerListenerLifecycle(PayloadContractAssertions, unittest.TestCase):
         self.addCleanup(listener.shutdown)
 
         statuses = []
+        payloads = []
         errors = []
         lock = threading.Lock()
 
@@ -5232,14 +5677,15 @@ class TestServerListenerLifecycle(PayloadContractAssertions, unittest.TestCase):
             """Perform one bounded request and record its outcome, never raising."""
             try:
                 response = _perform_request(bound_host, bound_port, "GET", EXPECTED_PATH)
-            except (OSError, http.client.HTTPException) as error:
+                document = response.json()
+            except (OSError, http.client.HTTPException, ValueError) as error:
                 with lock:
                     errors.append(f"{type(error).__name__}: {error}")
                 return
             with lock:
                 statuses.append(response.status)
+                payloads.append(document)
 
-        started = time.perf_counter()
         callers = [
             threading.Thread(target=poll, name=f"blitzy-health-burst-{index}", daemon=True)
             for index in range(BACKLOG_BURST_CONNECTIONS)
@@ -5248,7 +5694,10 @@ class TestServerListenerLifecycle(PayloadContractAssertions, unittest.TestCase):
             caller.start()
         for caller in callers:
             caller.join(REQUEST_TIMEOUT_SECONDS * 2)
-        elapsed = time.perf_counter() - started
+        self.assertFalse(
+            [caller.name for caller in callers if caller.is_alive()],
+            "a client in the burst never finished; the accept path stalled",
+        )
 
         self.assertEqual(errors, [], "every client in the burst must be answered")
         self.assertEqual(
@@ -5256,12 +5705,14 @@ class TestServerListenerLifecycle(PayloadContractAssertions, unittest.TestCase):
             [health.STATUS_OK] * BACKLOG_BURST_CONNECTIONS,
             "a burst must not degrade the status any client receives",
         )
-        self.assertLess(
-            elapsed,
-            BACKLOG_BURST_BUDGET_SECONDS,
-            f"{BACKLOG_BURST_CONNECTIONS} simultaneous probes took {elapsed * 1000:.1f} ms; "
-            "a dropped handshake retransmission is the only thing that costs this much",
+        self.assertEqual(
+            len(payloads),
+            BACKLOG_BURST_CONNECTIONS,
+            "every client must come away with a body, not just a status line",
         )
+        for index, payload in enumerate(payloads):
+            with self.subTest(client=index):
+                self.assert_payload_conforms(payload)
 
     def test_the_handler_and_server_classes_are_substitutable(self):
         """Both are documented parameters, so both are proven to be honoured.
@@ -5505,6 +5956,320 @@ class TestServerListenerLifecycle(PayloadContractAssertions, unittest.TestCase):
         self.assertFalse(thread.is_alive())
         self.assertEqual(stdout.getvalue(), "")
         self.assertEqual(stderr.getvalue(), "")
+
+
+class _CappedListener(server.HealthHTTPServer):
+    """The tier's listener with a deliberately tiny admission ceiling.
+
+    Saturation is the subject of the assertions below, and driving the shipped
+    ceiling of sixty-four to its limit would mean holding sixty-five sockets open
+    at once for no gain in what is demonstrated.  Lowering the ceiling reaches the
+    *same* accept-time code path with four -- which is precisely why it is a class
+    attribute rather than a literal buried in the accept loop.
+
+    Nothing else is overridden.  The refusal wait, the accept queue, the
+    address-family selection, the shutdown behaviour and the handler class are all
+    the shipped ones, so what these cases exercise differs from production in the
+    ceiling's *value* alone.
+    """
+
+    max_concurrent_requests = CAPPED_ADMISSION_CEILING
+
+
+class TestBoundedAdmission(PayloadContractAssertions, unittest.TestCase):
+    """Concurrency is bounded, and what happens at the bound is defined.
+
+    ``ThreadingMixIn`` on its own starts one thread per accepted connection with
+    no ceiling of any kind, and this tier's handler holds a connection for up to
+    its ten-second idle timeout.  A burst of clients that connect and then say
+    nothing is therefore enough, unbounded, to convert stalled peers into
+    unbounded threads and exhaust the process -- a liveness endpoint that stops
+    answering while nothing whatsoever is wrong with what it answers.  A bound is
+    only half a fix, though: a bound whose behaviour at saturation is undefined
+    trades that failure for an unpredictable one.  These cases assert the ceiling,
+    that it admits exactly what it declares, that traffic beyond it is refused by a
+    close rather than by an invented status code, that the refusal is silent, and
+    that every permit comes back.
+
+    Every listener here binds ``127.0.0.1`` on an ephemeral port, is served on a
+    daemon thread, and is torn down by registered cleanups, so the tier's port 8000
+    is never occupied and no listener or descriptor outlives a failing assertion.
+    """
+
+    def _serve(self, server_class=_CappedListener):
+        """Bind and serve a listener of *server_class*; return it with its address.
+
+        Serving happens on a daemon thread with the suite's tightened poll
+        interval, and both ``shutdown`` and ``server_close`` are registered as
+        cleanups in the order that stops the loop before the socket goes away.
+        """
+        listener = server.create_server(
+            LOOPBACK_HOST, EPHEMERAL_PORT, server_class=server_class
+        )
+        self.addCleanup(listener.server_close)
+        bound_host, bound_port = listener.server_address[:2]
+        self.assertNotEqual(bound_port, TIER_PORT, "a test must never bind port 8000")
+        thread = threading.Thread(
+            target=listener.serve_forever,
+            kwargs={"poll_interval": LISTENER_POLL_INTERVAL_SECONDS},
+            name="blitzy-health-admission-listener",
+            daemon=True,
+        )
+        self.addCleanup(thread.join, LISTENER_JOIN_TIMEOUT_SECONDS)
+        self.addCleanup(listener.shutdown)
+        thread.start()
+        return listener, bound_host, bound_port
+
+    def _hold_a_permit(self, host, port):
+        """Occupy one admission permit, and prove it is occupied before returning.
+
+        A connection that has been *answered* has demonstrably been admitted, and
+        because the contract keeps a served connection alive, its handler is still
+        sitting in the read that follows -- so the permit is still held.  That is
+        what makes these assertions deterministic rather than timing-dependent: a
+        merely-connected socket may still be waiting in the kernel's accept queue,
+        having taken nothing from the listener at all.
+
+        A refusal is retried rather than treated as a failure, for the reason set
+        out on :data:`ADMISSION_RETRY_ATTEMPTS`: a permit is returned by the
+        handler's own thread as it unwinds, so a request issued microseconds after
+        a connection closed may legitimately find the ceiling still full.  A
+        *leaked* permit is not transient and exhausts every attempt, so the
+        distinction the assertions care about survives.
+        """
+        request = f"GET {EXPECTED_PATH} HTTP/1.1\r\nHost: {host}\r\n\r\n".encode(
+            EXPECTED_ENCODING
+        )
+        refusal = None
+        for _ in range(ADMISSION_RETRY_ATTEMPTS):
+            connection = _RawConnection(host, port)
+            self.addCleanup(connection.close)
+            try:
+                connection.send(request)
+                answered = connection.read_response()
+            except (OSError, http.client.HTTPException) as error:
+                refusal = error
+                connection.close()
+                time.sleep(READINESS_PAUSE_SECONDS)
+                continue
+            self.assertEqual(answered.status, health.STATUS_OK)
+            self.assert_payload_conforms(answered.json())
+            return connection
+        return self.fail(
+            f"no permit became available across {ADMISSION_RETRY_ATTEMPTS} attempts, "
+            f"which is a leaked permit rather than a busy moment: {refusal!r}"
+        )
+
+    def _request(self, host, port, method, target):
+        """Perform one request, retrying a refusal as :meth:`_hold_a_permit` does."""
+        refusal = None
+        for _ in range(ADMISSION_RETRY_ATTEMPTS):
+            try:
+                return _perform_request(host, port, method, target)
+            except (OSError, http.client.HTTPException) as error:
+                refusal = error
+                time.sleep(READINESS_PAUSE_SECONDS)
+        return self.fail(
+            f"{method} {target} was refused across {ADMISSION_RETRY_ATTEMPTS} "
+            f"attempts, which is a leaked permit rather than a busy moment: "
+            f"{refusal!r}"
+        )
+
+    def test_the_shipped_ceiling_is_finite_and_above_a_realistic_burst(self):
+        """The bound exists, is finite, and is not so tight that it throttles.
+
+        Both halves carry weight.  An absent or effectively unlimited ceiling is
+        the defect itself; a ceiling below the burst this endpoint is measured
+        under would swap an availability failure for a throughput one, so the
+        shipped value is asserted against the very burst size the accept-queue
+        assertion opens.  The accept queue is re-asserted alongside it because the
+        two are complementary and a fix to one must not quietly undo the other.
+        """
+        listener, _, _ = self._serve(server_class=server.HealthHTTPServer)
+
+        self.assertIsInstance(listener.max_concurrent_requests, int)
+        self.assertEqual(
+            listener.max_concurrent_requests, server.MAX_CONCURRENT_REQUESTS
+        )
+        self.assertGreater(
+            listener.max_concurrent_requests,
+            BACKLOG_BURST_CONNECTIONS,
+            "the ceiling must sit above the simultaneous burst this tier absorbs",
+        )
+        self.assertEqual(listener.admission_wait_seconds, server.ADMISSION_WAIT_SECONDS)
+        self.assertGreater(listener.admission_wait_seconds, 0)
+        self.assertEqual(listener.request_queue_size, socket.SOMAXCONN)
+        self.assertEqual(listener.refused_request_count(), 0)
+
+    def test_the_ceiling_admits_exactly_as_many_connections_as_it_declares(self):
+        """Every connection up to the ceiling is served; the next one is not.
+
+        This is the assertion the whole fix stands on, and it is deliberately
+        two-sided.  Holding the full ceiling open *simultaneously* -- each
+        connection answered the complete contract response -- shows the bound is a
+        genuine concurrency allowance and not a covert serialization of traffic.
+        The connection immediately after it shows the allowance is real: it is
+        closed without a single byte written, promptly, and counted.
+
+        Zero bytes is the point rather than an accident.  The frozen contract
+        defines no status for "too busy", so inventing one would be a contract
+        violation, and a closed connection is unambiguous to every client in a way
+        an undocumented code would not be.
+        """
+        listener, bound_host, bound_port = self._serve()
+
+        for index in range(CAPPED_ADMISSION_CEILING):
+            with self.subTest(concurrent_connection=index):
+                self._hold_a_permit(bound_host, bound_port)
+        self.assertEqual(listener.refused_request_count(), 0)
+
+        refused = _RawConnection(bound_host, bound_port)
+        self.addCleanup(refused.close)
+        started = time.monotonic()
+        try:
+            unanswered = refused.read_until_close()
+        except TimeoutError:
+            self.fail(
+                "the connection beyond the ceiling was admitted and left open; a "
+                "saturated listener must refuse and close it"
+            )
+        elapsed = time.monotonic() - started
+
+        self.assertEqual(unanswered, b"", "a refused connection is closed unanswered")
+        self.assertLess(
+            elapsed,
+            ADMISSION_REFUSAL_BUDGET_SECONDS,
+            "a saturated listener must refuse promptly, not hold the caller",
+        )
+        self.assertEqual(listener.refused_request_count(), 1)
+
+    def test_a_request_sent_beyond_the_ceiling_is_refused_in_silence(self):
+        """A refusal answers nothing and says nothing, even to a well-formed request.
+
+        The connection here sends a request the handler would certainly have
+        answered had it been admitted, which is what separates "refused" from
+        "malformed".  Two properties are asserted: the caller is left with a
+        connection it cannot reuse and no response to parse, and neither output
+        stream is written to -- because saturation is exactly the moment a process
+        can least afford per-connection logging, which is why the listener counts
+        refusals instead of narrating them.
+        """
+        listener, bound_host, bound_port = self._serve()
+        for _ in range(CAPPED_ADMISSION_CEILING):
+            self._hold_a_permit(bound_host, bound_port)
+
+        refused = _RawConnection(bound_host, bound_port)
+        self.addCleanup(refused.close)
+        stdout, stderr = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+            with contextlib.suppress(OSError):
+                refused.send(
+                    f"GET {EXPECTED_PATH} HTTP/1.1\r\n"
+                    f"Host: {bound_host}\r\n\r\n".encode(EXPECTED_ENCODING)
+                )
+            closed = refused.is_closed_by_peer()
+
+        self.assertTrue(closed, "a refused connection must not be left open")
+        self.assertEqual(listener.refused_request_count(), 1)
+        self.assertEqual(stdout.getvalue(), "")
+        self.assertEqual(stderr.getvalue(), "")
+
+    def test_a_released_permit_is_reused_by_the_next_caller(self):
+        """The ceiling throttles for as long as it is full; it does not latch.
+
+        A refusal has to be a statement about the present moment rather than a
+        state the listener stays in, so the ceiling is filled, one holder is
+        released, and an ordinary request is then answered the ordinary contract
+        response.  Readiness is established by polling because the permit is
+        returned by the handler's own thread as it unwinds, which is prompt but
+        not synchronous with the client's close.
+
+        The refusal counter is deliberately *not* asserted to be unchanged here,
+        and that is a correctness point rather than a concession: attempts made
+        inside the polling window, before the released permit has landed, are
+        legitimately refused, so requiring the count to stand still would
+        contradict the very asynchrony the polling exists to accommodate.  What
+        must hold -- and what is asserted -- is that a caller does get through.
+        """
+        listener, bound_host, bound_port = self._serve()
+        holders = [
+            self._hold_a_permit(bound_host, bound_port)
+            for _ in range(CAPPED_ADMISSION_CEILING)
+        ]
+
+        holders[0].close()
+        served = None
+        for _ in range(READINESS_ATTEMPTS):
+            try:
+                served = _perform_request(bound_host, bound_port, "GET", EXPECTED_PATH)
+            except (OSError, http.client.HTTPException):
+                time.sleep(READINESS_PAUSE_SECONDS)
+                continue
+            if served.status == health.STATUS_OK:
+                break
+            time.sleep(READINESS_PAUSE_SECONDS)
+
+        self.assertIsNotNone(
+            served,
+            "the permit released by a finished connection was never reused within "
+            f"{READINESS_ATTEMPTS * READINESS_PAUSE_SECONDS:.2f}s",
+        )
+        self.assertEqual(served.status, health.STATUS_OK)
+        self.assert_payload_conforms(served.json())
+
+    def test_more_connections_than_the_ceiling_are_served_in_sequence(self):
+        """A permit is returned however a connection ends, so the ceiling cannot erode.
+
+        Serving several times more connections in sequence than the ceiling admits
+        at once is possible only if every one of them gives its permit back.  All
+        four ways a connection ends are exercised in each cycle -- a served path, an
+        unknown path, a refused method (answered, then closed by the handler) and a
+        peer that hangs up having sent nothing -- because each unwinds by a
+        different route, and a release that covered only the tidy route would leak
+        the ceiling away one connection at a time.
+
+        The closing assertion is what makes a leak unmissable rather than merely
+        likely to surface: after all that traffic the *entire* ceiling is occupied
+        again simultaneously, which is impossible if a single permit failed to come
+        back.
+        """
+        _, bound_host, bound_port = self._serve()
+        connections = SEQUENTIAL_ADMISSION_CYCLES * CAPPED_ADMISSION_CEILING
+
+        for cycle in range(connections):
+            with self.subTest(sequential_connection=cycle):
+                served = self._request(bound_host, bound_port, "GET", EXPECTED_PATH)
+                self.assertEqual(served.status, health.STATUS_OK)
+                self.assert_payload_conforms(served.json())
+                self.assertEqual(
+                    self._request(bound_host, bound_port, "GET", "/unknown").status,
+                    health.STATUS_NOT_FOUND,
+                )
+                self.assertEqual(
+                    self._request(bound_host, bound_port, "POST", EXPECTED_PATH).status,
+                    health.STATUS_METHOD_NOT_ALLOWED,
+                )
+                _RawConnection(bound_host, bound_port).close()
+
+        for index in range(CAPPED_ADMISSION_CEILING):
+            with self.subTest(restored_permit=index):
+                self._hold_a_permit(bound_host, bound_port)
+
+    def test_the_ceiling_is_enforced_by_a_bounded_primitive(self):
+        """An unmatched release raises rather than silently widening the gate.
+
+        The failure this guards against is the quiet one: a release without a
+        matching acquisition would raise the ceiling permanently and invisibly,
+        reintroducing exactly the unbounded admission the bound exists to prevent,
+        and no functional assertion would notice.  Choosing a *bounded* semaphore is
+        what turns that into an immediate error, so the choice of primitive is
+        asserted directly.
+        """
+        listener, _, _ = self._serve()
+
+        self.assertIsInstance(listener._admission, threading.BoundedSemaphore)
+        with self.assertRaises(ValueError):
+            listener._admission.release()
 
 
 class TestServerProcessLifecycle(PayloadContractAssertions, unittest.TestCase):

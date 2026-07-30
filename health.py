@@ -1149,6 +1149,11 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     no-store`` and an explicit ``Content-Length``.  Only the ``405`` adds
     ``Allow``.
 
+    A refused method is refused **without the request body being read**, and the
+    connection then ends -- see :meth:`_respond_method_not_allowed`.  ``GET`` and
+    ``HEAD`` carry no body to leave unread, so an accepted method keeps its
+    connection and a poller's keep-alive probing is unaffected.
+
     The handler performs no I/O beyond reading the already-resolved
     configuration and the clock: no file access, no network call and no
     dependency interrogation.  It follows that the handler has no failure path
@@ -1181,44 +1186,37 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
 
     #: Idle timeout per accepted connection.  Without it, a client that opens a
     #: persistent connection and never completes a request would hold a worker
-    #: thread for the life of the process.  A probe takes single-digit
-    #: milliseconds, so ten seconds is generous.
-    timeout = 10
+    #: thread for the life of the process.
+    #:
+    #: Five seconds, because this is one half of a pair and the other half is a
+    #: *bounded* pool.  The listener serves connections on a fixed number of
+    #: reusable workers (:attr:`server.HealthHTTPServer.worker_threads`), so a
+    #: worker is a rationed resource and this value is how long one connection may
+    #: ration it while sending nothing at all.  Ten seconds was generous against
+    #: an unbounded thread-per-connection listener, where an idle connection cost
+    #: only its own thread; against a pool it is twice as long as anything needs
+    #: to hold a slot.  The measurements this endpoint is built on put a probe at
+    #: ~0.1 ms of work and a keep-alive round trip at ~0.5 ms, so five seconds is
+    #: still four orders of magnitude of headroom for the slowest legitimate
+    #: client, while halving the worst case a stalled one can impose.
+    #:
+    #: It is also the ceiling on how long a persistent connection can delay the
+    #: *last* reply after a shutdown, which is why the listener sets
+    #: ``block_on_close = False`` rather than relying on this value being small.
+    timeout = 5
 
-    #: Send every response the instant it is written, without waiting for the
-    #: peer to acknowledge the previous one.
+    #: ``TCP_NODELAY``: hand each response to the network without waiting for the
+    #: peer to acknowledge earlier data.  A probe sends one small response and then
+    #: goes quiet, so the write-coalescing this disables buys nothing here and can
+    #: instead delay a reply on a reused connection.
     #:
-    #: This is ``TCP_NODELAY``, and it is set because without it a *keep-alive*
-    #: probe pays a delayed-acknowledgement penalty that has nothing to do with
-    #: this application's work.  Measured on the reference host, three sequential
-    #: requests on one connection: the first completed in 0.5 ms, the second and
-    #: third in **40.8 ms and 41.1 ms** -- their headers arrived in 0.1-0.2 ms and
-    #: the *body* then sat unsent for the remainder.  Nagle's algorithm was
-    #: holding the second small segment of the response until the peer
-    #: acknowledged the first, and the peer's stack was itself delaying that
-    #: acknowledgement.  Two mechanisms, each individually reasonable, combining
-    #: into a stall an order of magnitude larger than the response it delayed.
-    #:
-    #: :meth:`_send` removes the second segment (see :meth:`_flush_response`), and
-    #: this flag removes the wait -- both, because they defend against different
-    #: halves of the same interaction and only the pair is robust: a response that
-    #: happened to exceed one segment would stall again with coalescing alone,
-    #: and a response written in two segments is a wasted round trip even with
-    #: ``TCP_NODELAY`` set.
-    #:
-    #: ``socketserver`` notes that this flag is intended for use with
-    #: ``wbufsize != 0``, its buffered-writer mode, and that pairing is
-    #: deliberately *not* adopted here.  Buffering would coalesce the writes as a
-    #: side effect, but it also moves the socket write out of :meth:`_send` and
-    #: into the base class's per-request ``wfile.flush()``, outside the
-    #: ``OSError`` guard that keeps an ordinary peer disconnect from becoming a
-    #: ``socketserver`` traceback on standard error.  Explicit coalescing keeps
-    #: the write, and therefore the error handling, exactly where the contract's
-    #: silence requirement needs it.
-    #:
-    #: The endpoint's responses are ~100-200 bytes and it performs no streaming,
-    #: so the small-packet concern the flag exists to guard against cannot arise
-    #: here: there is one write per response, and it is already one segment.
+    #: ``socketserver`` documents this flag as intended for use with
+    #: ``wbufsize != 0``, and that pairing is deliberately *not* adopted.
+    #: Buffering would move the socket write out of :meth:`_send` and into the
+    #: base class's per-request ``wfile.flush()``, outside the ``OSError`` guard
+    #: that keeps an ordinary peer disconnect from becoming a ``socketserver``
+    #: traceback on standard error.  Writing explicitly keeps the write, and so
+    #: the error handling, where the contract's silence requirement needs it.
     disable_nagle_algorithm = True
 
     #: The path this handler answers on: the value resolved at import, which
@@ -1226,12 +1224,6 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     #: a subclass can be pointed elsewhere in a test without mutating module
     #: state, which a configuration document cannot do.
     health_path = HEALTH_PATH
-
-    #: Upper bound on a request body this handler will consume before giving up
-    #: and closing the connection.  Nothing legitimate sends a body to this
-    #: endpoint; the drain exists only to keep a persistent connection framed.
-    _max_drain_bytes = 1 << 20
-    _drain_chunk_bytes = 1 << 16
 
     #: Protocol-level errors are raised by the base class *before* routing ever
     #: happens -- a malformed request line (``400``), an over-long request
@@ -1328,19 +1320,50 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
             self._abandon_connection(error)
 
     def _respond_method_not_allowed(self):
-        """Answer ``405`` with ``Allow: GET, HEAD`` and the error body."""
+        """Answer ``405`` with ``Allow: GET, HEAD``, reading no request body.
+
+        **The body of a refused request is never read.**  That is a normative
+        requirement of the contract (``docs/health-endpoint.md`` §5.4 clause 1),
+        not an optimization: the method check needs nothing from the body, and
+        the rule that this endpoint does no work it does not have to applies to a
+        refusal exactly as it applies to a success.  Reading megabytes solely to
+        discard them would turn the cheapest resource in the composition into a
+        free amplifier -- an unauthenticated caller could make this process do
+        arbitrary work by declaring a length and sending it.  RFC 9110 §9.3
+        explicitly permits a server to answer before the whole body has arrived.
+
+        Because those bytes are left unread, the connection cannot be reused: the
+        base class would parse the next request line starting from the middle of
+        the body.  Ending the connection is therefore the framing answer, and it
+        is taken for *every* refusal rather than only for the unmeasurable ones,
+        so the behaviour is uniform and does not depend on what the caller
+        declared.  ``close_connection`` is set **before** the response is written,
+        so the connection ends even if the peer disappears mid-write; nothing in
+        ``send_response``, ``send_header`` or ``end_headers`` resets it, and only
+        an explicit ``Connection`` header would -- which is why none is sent.
+        The contract's own responses carry no ``Connection: close`` (§5.1.2), so
+        the closure is performed rather than advertised, and the ``405``'s header
+        set stays exactly the frozen one: ``Allow``, ``Content-Type``,
+        ``Cache-Control``, ``Content-Length``.
+
+        The measured consequence, recorded so it does not surprise a caller: a
+        ``POST`` whose body fits the socket buffers -- 1 MiB does -- is answered
+        the complete frozen ``405`` and the caller reads it, then finds the
+        connection closed and opens a new one for its next request.  A caller
+        that writes more than the buffers hold sees its own ``send`` fail, which
+        is the correct outcome of a server that answered early rather than a
+        fault at either end.
+        """
         try:
-            drained = self._drain_request_body()
+            # Set first: the refusal ends this connection whatever happens to the
+            # write below, and no request byte is consumed on the way there.
+            self.close_connection = True
             self._send(
                 STATUS_METHOD_NOT_ALLOWED,
                 METHOD_NOT_ALLOWED_BODY,
                 write_body=True,
                 allow=ALLOW_HEADER_VALUE,
             )
-            if not drained:
-                # An unread request body would desynchronize a persistent
-                # connection, so this one ends after the response.
-                self.close_connection = True
         # Deliberately broad: see _abandon_connection for why nothing may
         # escape a request handler here.
         except Exception as error:
@@ -1355,9 +1378,8 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         away mid-response, which is the client's business and not this
         application's fault, so the connection is abandoned quietly.
 
-        The whole response leaves in a single write: see :meth:`_flush_response`
-        for why that is a correctness property of a keep-alive probe and not a
-        micro-optimization.
+        Head and body are handed to the socket together; see
+        :meth:`_flush_response`.
         """
         try:
             self.send_response(status)
@@ -1373,43 +1395,24 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     def _flush_response(self, payload):
         """Emit the buffered head and ``payload`` in one write to the socket.
 
-        The base class buffers the status line and every header, then
-        :meth:`~http.server.BaseHTTPRequestHandler.end_headers` appends the blank
-        line and flushes -- one write -- after which a caller writes the body,
-        which on this handler's unbuffered ``wfile`` (``socketserver`` sets
-        ``wbufsize = 0``) is a *second* write and therefore a second TCP segment.
-        That second segment is what stalled behind Nagle and delayed
-        acknowledgement for ~41 ms on every keep-alive request after the first;
-        :attr:`disable_nagle_algorithm` records the measurement.
+        The base class flushes the head on ``end_headers`` and leaves the body to
+        a second write, because ``socketserver`` gives this handler an unbuffered
+        ``wfile`` (``wbufsize = 0``).  Appending the body to the same buffer and
+        flushing once emits the identical bytes and saves a round trip.
+        ``flush_headers`` is preferred to a hand-rolled write because it is the
+        base class's own flush: it joins the buffer, writes it, and -- crucially on
+        a persistent connection -- clears it, so nothing leaks into the next
+        response.
 
-        Appending the body to the same buffer and flushing once produces the
-        identical bytes in one segment.  ``flush_headers`` is used rather than a
-        hand-rolled write because it is the base class's own documented flush: it
-        joins the buffer, writes it, and -- importantly on a persistent connection
-        -- clears it, so nothing can leak into the next response on the same
-        socket.
+        Two cases have no buffer to append to and fall back to the base class's
+        sequence, which writes the same response in two writes:
 
-        Two cases do not have a header buffer to append to, and both fall back to
-        the base class's own sequence so that the bytes on the wire are exactly
-        what they are today:
-
-        * **An HTTP/0.9 request.**  A request line carrying no version leaves
-          ``send_response_only``, ``send_header`` and ``end_headers`` as no-ops,
-          so there is no status line and no header block -- the peer receives the
-          body alone, which is all RFC 1945 §6 defines for a version-less
-          request.  That is deliberate standard-library behaviour and is
-          preserved verbatim.
-        * **A buffer the base class did not create, or created as something other
-          than a list.**  ``_headers_buffer`` is the standard library's private
-          attribute.  It has had the same shape for the entire 3.x series, but
-          this method does not require it: if the attribute is missing or is not a
-          list, the response is written the long way instead.  A fallback costs a
-          round trip; guessing wrong about a private attribute would cost the
-          response.
-
-        Either fallback still writes the correct response -- only in two segments
-        rather than one, which is precisely the condition
-        :attr:`disable_nagle_algorithm` also protects against.
+        * **HTTP/0.9**, where ``send_response_only``/``send_header``/
+          ``end_headers`` are all no-ops, so the peer correctly receives the body
+          alone (RFC 1945 §6).  Preserved verbatim.
+        * **A missing or non-list ``_headers_buffer``.**  It is a private
+          attribute; guessing wrong about it would cost the response, so its shape
+          is checked rather than assumed.
 
         :param payload: the response body, or ``b""`` for a ``HEAD``.
         """
@@ -1532,38 +1535,6 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         path, so it routes to the contract's ``404`` rather than raising.
         """
         return request_target_path(self._raw_request_target())
-
-    def _drain_request_body(self):
-        """Consume a rejected request's body so the connection stays framed.
-
-        Returns ``True`` when there was nothing to read or the body was read in
-        full, and ``False`` when the caller should close the connection
-        instead: a chunked or otherwise transfer-encoded body cannot be
-        measured up front, an unparseable or oversized ``Content-Length``
-        cannot be trusted, and a truncated read means the peer stopped early.
-        """
-        headers = self.headers
-        if headers is None:
-            return True
-        if _coerce_text(headers.get("Transfer-Encoding"), None) is not None:
-            return False
-        raw_length = headers.get("Content-Length")
-        if raw_length is None:
-            return True
-        try:
-            remaining = int(str(raw_length).strip(), 10)
-        except ValueError:
-            return False
-        if remaining <= 0:
-            return True
-        if remaining > self._max_drain_bytes:
-            return False
-        while remaining > 0:
-            chunk = self.rfile.read(min(remaining, self._drain_chunk_bytes))
-            if not chunk:
-                return False
-            remaining -= len(chunk)
-        return True
 
     def send_error(self, code, message=None, explain=None):
         """Answer a protocol-level error with a fixed, safe reason phrase.

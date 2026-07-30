@@ -29,6 +29,11 @@ Four invariants this module holds:
 * **A failed bind is reported, never disguised**, and never worked around by
   moving to another port: every probe targets a known port, so a silent shift
   would turn a clear failure into a confusing one.
+* **Concurrency is bounded, and saturation is defined.**  At most
+  :data:`MAX_CONCURRENT_REQUESTS` connections are served at once; beyond that the
+  accept loop waits briefly and then refuses -- closing the connection without a
+  response and counting it -- so a burst of stalled clients cannot turn into
+  unbounded threads.  See :class:`HealthHTTPServer`.
 
 Standard library only -- ``http.server.ThreadingHTTPServer`` and nothing else.
 Flask, FastAPI, Starlette, uvicorn, gunicorn and waitress were each considered
@@ -81,6 +86,8 @@ __all__ = [
     # Declared defaults and process-level constants.
     "DEFAULT_HOST",
     "DEFAULT_PORT",
+    "MAX_CONCURRENT_REQUESTS",
+    "ADMISSION_WAIT_SECONDS",
     "SHUTDOWN_SIGNALS",
     "EXIT_OK",
     "EXIT_BIND_FAILURE",
@@ -130,6 +137,56 @@ EXIT_BIND_FAILURE = 1
 #: must return exactly 0 or 1 -- and this module is never a probe: a probe would
 #: be a separate one-shot client, not the server itself.
 EXIT_SHUTDOWN_FAILURE = 2
+
+#: Accepted connections this listener will serve at once.
+#:
+#: A bound is mandatory rather than a refinement, and the reason is the handler's
+#: own idle timeout: this tier speaks HTTP/1.1 with a ten-second idle timeout per
+#: connection, so a client that connects and then stalls occupies a thread for up
+#: to ten seconds while doing nothing.  Unbounded admission converts a burst of
+#: such clients directly into unbounded threads -- each with its own stack and
+#: file descriptor -- and the first symptom is not a slow endpoint but a process
+#: that cannot allocate a thread at all.  A liveness endpoint failing that way is
+#: the worst outcome available: it stops answering while nothing is wrong with
+#: what it answers.  ``daemon_threads`` and a deep accept queue do not help here;
+#: neither caps *work*, they only decide who waits and who is reaped.
+#:
+#: The value is chosen against the burst this tier is actually measured under.
+#: The accept-queue assertion in the sibling test suite opens **40** simultaneous
+#: connections and requires every one of them to be answered, so a cap at or
+#: below that number would throttle a poll burst this endpoint is expected to
+#: absorb.  Sixty-four sits above it with headroom while still bounding the
+#: process to a commitment it can always meet.  It is a class attribute, so a
+#: subclass -- a test, or a deployment with a different profile -- may lower or
+#: raise it without editing this module.
+MAX_CONCURRENT_REQUESTS = 64
+
+#: How long the accept loop waits for a permit before refusing the connection.
+#:
+#: Not zero, because a burst that merely *arrives* faster than it is served is
+#: normal for a polled resource and must not be refused: a brief wait absorbs it.
+#: Not long either, and that is the more important half.  This wait is taken *in
+#: the accept loop*, so every millisecond of it is a millisecond the listener is
+#: not accepting anyone -- which is the same stall that ruled out serving a
+#: refused connection on the caller's thread (see :meth:`process_request`).  A
+#: generous wait would answer thread exhaustion by introducing an accept-loop
+#: stall instead, and under sustained overload it would make refusals trickle out
+#: at a fixed rate while everyone behind them queued in the kernel with no signal
+#: at all.  A refused caller can retry at once; a queued caller can only wait.
+#:
+#: Twenty-five milliseconds is derived from measurement.  Sixty-four simultaneous
+#: exchanges against this listener complete in 19-30 ms end to end -- a permit
+#: freed every 0.3-0.5 ms, with the slowest single exchange at ~13 ms -- so this
+#: wait is roughly two of the slowest requests and fifty of the average ones, and
+#: a healthy micro-burst just above the ceiling is absorbed without a refusal.
+#: What it deliberately does *not* absorb is the pathological case: a client that
+#: connects and stalls holds its permit for up to the handler's ten-second idle
+#: timeout, which no admission wait could ever wait out, so it is refused after
+#: 25 ms rather than after half a second.  The accept loop is therefore never
+#: stalled for more than 25 ms per refused connection, and a probe arriving during
+#: genuine saturation gets a definite answer -- a closed connection -- far inside
+#: its own three-second timeout.
+ADMISSION_WAIT_SECONDS = 0.025
 
 #: How long :meth:`~socketserver.BaseServer.serve_forever` waits between checks
 #: of its shutdown flag.  A signal interrupts the wait immediately (PEP 475
@@ -381,64 +438,85 @@ def _write_stderr(lines):
 
 
 class HealthHTTPServer(ThreadingHTTPServer):
-    """The tier's listener: threaded, promptly closeable, single-port.
+    """The tier's listener: threaded, *bounded*, promptly closeable, single-port.
 
     Threaded rather than :class:`~http.server.HTTPServer` because a health
-    endpoint must answer while several clients poll it at once.  With one
-    thread, a client that opens a connection and stalls holds the accept loop
-    and every subsequent probe queues behind it -- a liveness probe a slow
-    client can silence reports the opposite of the truth.
+    endpoint must answer while several clients poll it at once: with one thread, a
+    client that connects and stalls holds the accept loop and every later probe
+    queues behind it, so a liveness probe a slow client can silence reports the
+    opposite of the truth.
 
-    All five class attributes are set explicitly because each is load-bearing:
+    Threaded, but **not unboundedly threaded**.  ``ThreadingMixIn`` spawns one
+    thread per accepted connection and imposes no ceiling, so the plain mixin
+    answers "how many clients at once?" with "as many as ask" -- the wrong answer
+    for a resource whose whole job is to keep answering.  Each connection costs a
+    thread, a stack and a descriptor for as long as it is held, and because the
+    handler speaks HTTP/1.1 a client that says nothing at all still holds one for
+    the full ten-second idle timeout, so a caller can turn stalled peers into
+    unbounded threads and eventually meet ``RuntimeError: can't start new
+    thread`` -- at which point the accept loop stops serving *everyone*.
+
+    So :meth:`process_request` admits at most :attr:`max_concurrent_requests`
+    connections at a time and applies explicit back-pressure beyond that:
+    :attr:`admission_wait_seconds` of waiting, then an immediate refusal -- closed
+    with no response written, and counted.  Three properties follow, and each is
+    the reason for the shape.  *Thread count is a property of this class, not of
+    the caller*, because the ceiling is a fixed number this class owns.  *Overload
+    is bounded and honest*, because the newest arrival is closed at once, which a
+    client reads as a reset it can retry rather than a timeout it must wait out;
+    running the overflow on the caller's thread is deliberately rejected here,
+    since that caller *is* the accept loop.  *Shutdown stays as prompt as it was*,
+    because nothing in the stop path waits on an in-flight reply -- see
+    ``block_on_close`` below, whose contract this preserves exactly.  The Java
+    tier of this composition makes the same choice with a fixed pool over a
+    bounded queue and an explicit rejection policy; the mechanism differs because
+    the runtimes do, the guarantee does not.
+
+    All five inherited ``socketserver`` class attributes are set explicitly
+    because each is load-bearing:
 
     ``daemon_threads = True``
         Request threads must never keep the interpreter alive after the main
         thread finishes.  The base class already sets it; repeated here so the
-        guarantee is visible at the point that depends on it.
+        guarantee is visible where it is depended on.
 
     ``block_on_close = False``
-        The single setting that makes shutdown provably prompt.  With ``True``,
-        ``server_close`` joins every in-flight request thread -- and the handler
-        speaks HTTP/1.1 with a ten-second idle timeout, so one client holding a
-        keep-alive connection would delay shutdown by up to ten seconds, which a
-        supervisor would read as a hang and escalate to ``SIGKILL``.  The
-        trade-off is correct for this workload: a probe response is a handful of
-        bytes built with no I/O, so the only thing interruptible is a reply to a
-        caller that has just been told the process is going away.
+        Keeps shutdown prompt.  With ``True``, ``server_close`` joins in-flight
+        request threads, so one keep-alive client could stall it for the handler's
+        full ten-second idle timeout -- long enough for a supervisor to read as a
+        hang and ``SIGKILL``.  Little is lost: the only interruptible work is a
+        reply to a caller already told the process is going away.
 
     ``allow_reuse_address = True``
-        ``SO_REUSEADDR``, so an immediate restart succeeds instead of failing
-        while the previous socket drains ``TIME_WAIT``.  It does *not* let this
-        server bind a port another process is actively listening on, which is
-        what keeps the port-in-use diagnostic honest.
+        ``SO_REUSEADDR``, so an immediate restart is not blocked by the previous
+        socket draining ``TIME_WAIT``.  It does *not* permit binding a port
+        another process is actively listening on, which keeps the port-in-use
+        diagnostic honest.
 
     ``allow_reuse_port = False``
-        Must never be relaxed.  ``SO_REUSEPORT`` would let a second instance
-        bind the *same live* port and take a share of the connections, so a
-        duplicate start would appear to succeed while probes reached whichever
-        instance the kernel chose.
+        Must never be relaxed: ``SO_REUSEPORT`` would let a second instance bind
+        the *same live* port and take a share of the connections, so a duplicate
+        start would look successful while probes reached an arbitrary instance.
 
     ``request_queue_size = socket.SOMAXCONN``
-        The value passed to ``listen()``: how many connections the kernel may
-        hold for this listener between the completed handshake and
-        ``accept()``.  ``socketserver`` defaults it to **5**, which is far too
-        small for a resource whose whole purpose is to be polled, and the
-        shortfall is measurable rather than theoretical: with 40 clients
-        connecting at once, 20 of them spent **~1004 ms inside ``connect()``**
-        while the request/response exchange itself took ~2 ms.  That is not slow
-        serving, it is a dropped ``SYN`` -- the queue overflowed, the kernel
-        discarded the handshake, and the client's stack retransmitted one initial
-        round-trip timeout later.  A probe that times out at 1 s would have
-        recorded this endpoint as *down* while it was answering every request it
-        received in single-digit milliseconds, which is the worst failure a
-        health check can have.  The sibling tiers do not have the problem
-        because their runtimes already choose a generous backlog -- Node listens
-        with 511 and the JDK with 50 -- so raising it here removes a divergence
-        rather than introducing one.  ``SOMAXCONN`` is used rather than a
-        hand-picked number because the ceiling that matters is the operating
-        system's (Linux clamps the request to ``net.core.somaxconn``), and the
-        only cost of a large value is kernel bookkeeping for handshakes this
-        server is about to accept anyway.
+        The ``listen()`` backlog.  ``socketserver`` defaults it to 5, too small
+        for a resource whose purpose is to be polled: on overflow the kernel drops
+        the handshake and the client waits out a retransmit, so a probe can time
+        out against a server answering everything it actually receives.
+        ``SOMAXCONN`` defers to the operating system's ceiling instead of guessing.
+
+        The accept queue and the admission bound are complementary rather than
+        alternatives, and conflating them is the mistake to avoid: the queue
+        decides how many completed handshakes the *kernel* will hold for this
+        listener, while the bound decides how much work this *process* will carry
+        at once.  A deep queue with unbounded admission converts a burst into
+        unbounded threads faster; a shallow queue with a bound drops handshakes
+        the process could have served.  Both are therefore set.
+
+    The ceiling, and the wait allowed before refusing, are class attributes for
+    the same reason the five above are: they are the bound, so they belong where a
+    reader looks for it, and a subclass in a test can lower the ceiling to reach
+    the refusal path without opening sixty-five sockets.
     """
 
     daemon_threads = True
@@ -446,6 +524,17 @@ class HealthHTTPServer(ThreadingHTTPServer):
     allow_reuse_address = True
     allow_reuse_port = False
     request_queue_size = socket.SOMAXCONN
+
+    #: Ceiling on concurrently served connections.  See
+    #: :data:`MAX_CONCURRENT_REQUESTS` for how the value is derived, and
+    #: :meth:`process_request` for what happens at the ceiling.  Read once per
+    #: instance, in :meth:`__init__`, so a subclass may lower it for a test or
+    #: raise it for a deployment without touching this module.
+    max_concurrent_requests = MAX_CONCURRENT_REQUESTS
+
+    #: Seconds the accept loop waits for a permit before refusing.  See
+    #: :data:`ADMISSION_WAIT_SECONDS`.
+    admission_wait_seconds = ADMISSION_WAIT_SECONDS
 
     def __init__(
         self,
@@ -463,9 +552,115 @@ class HealthHTTPServer(ThreadingHTTPServer):
 
         The capitalised parameter name follows :mod:`socketserver` exactly, so
         this subclass stays a drop-in replacement for keyword callers.
+
+        The admission permits and the refusal counter are created here, before
+        the base class binds anything, so no accepted connection can reach
+        :meth:`process_request` without them.  A
+        :class:`threading.BoundedSemaphore` is used rather than a plain one
+        deliberately: a release not matched by an acquire would be a defect in
+        this class, and the bounded variant turns it into an immediate
+        ``ValueError`` instead of a ceiling that silently grows.
         """
         self.address_family = _address_family(server_address[0])
+        self._admission = threading.BoundedSemaphore(self.max_concurrent_requests)
+        self._refusal_lock = threading.Lock()
+        self._refused_requests = 0
         super().__init__(server_address, RequestHandlerClass, bind_and_activate)
+
+    # Bounded admission.  ``socketserver`` calls ``process_request`` once per
+    # accepted connection, from the accept loop, and treats whatever it does as
+    # the dispatch policy.  Overriding it replaces that policy while leaving the
+    # per-connection lifecycle (serve, finish, error, close) exactly as
+    # ``socketserver`` defines it.
+
+    def refused_request_count(self):
+        """Return how many connections have been refused for want of a permit.
+
+        Saturation is *counted* rather than logged, and the choice is deliberate.
+        The contract admits no per-request logging, and a refusal arrives exactly
+        when the process is already under pressure -- the moment a per-connection
+        log line is least affordable.  The Java tier's back-pressure policy is
+        silent for the same reason.  A counter keeps the event observable without
+        making load noisy: a test can assert it, and an operator can read it from
+        an interactive session.
+
+        :returns: the count, read under the lock that guards it, so a caller never
+            observes a partially updated value.
+        """
+        with self._refusal_lock:
+            return self._refused_requests
+
+    def process_request(self, request, client_address):
+        """Admit one connection, or refuse it explicitly and close it.
+
+        This is the whole of the admission decision, and it runs on the accept
+        loop's own thread -- which is what makes the wait below back-pressure
+        rather than bookkeeping: while it waits, this listener accepts nothing
+        further and the kernel holds the pending handshakes in the accept queue
+        instead.
+
+        Three outcomes, all defined:
+
+        * **A permit is available** -- the connection is handed to the base class,
+          which serves it on its own thread exactly as before.  The permit is
+          released by :meth:`process_request_thread` when that thread finishes.
+        * **No permit within** :attr:`admission_wait_seconds` -- the connection is
+          refused: closed immediately, with **no response written**, and counted.
+          Nothing is invented on the wire, because the contract's status vocabulary
+          is exactly ``200``, ``404`` and ``405``, and a saturated listener has
+          none of those to say; a closed connection is unambiguous where an
+          undocumented status code would not be.  The close goes through
+          :meth:`~socketserver.TCPServer.shutdown_request`, the same path a served
+          connection ends on, so the peer reads end-of-stream at once instead of
+          waiting out a timeout, and no descriptor is leaked.  Serving the
+          connection inline on the accept thread -- the Java tier's caller-runs
+          policy -- was considered and rejected *at this tier*, and the reason is a
+          difference in the runtimes rather than a difference of opinion.  That
+          tier's dispatcher has already read the whole request before its executor
+          is involved, so running the rejected work inline costs microseconds of
+          payload building.  Here the accept loop hands over a *raw socket*:
+          running it inline would mean conducting the entire HTTP conversation on
+          the accept thread, including waiting up to the handler's ten-second idle
+          timeout for a client that may never speak.  One stalled client would then
+          stop the listener accepting at all -- precisely the failure the bound
+          exists to prevent.
+        * **The thread cannot be started** -- the permit is returned before the
+          exception propagates, so a transient failure cannot erode the ceiling one
+          permit at a time.  ``socketserver`` reports and closes such a request
+          itself.
+
+        :param request: the accepted connection socket.
+        :param client_address: the peer address, as :mod:`socketserver` supplies
+            it, passed through untouched and deliberately never rendered into a
+            diagnostic.
+        """
+        if not self._admission.acquire(timeout=self.admission_wait_seconds):
+            with self._refusal_lock:
+                self._refused_requests += 1
+            self.shutdown_request(request)
+            return
+        try:
+            super().process_request(request, client_address)
+        except BaseException:
+            self._admission.release()
+            raise
+
+    def process_request_thread(self, request, client_address):
+        """Serve one admitted connection, then return its permit.
+
+        The base implementation is called unchanged and the release sits in a
+        ``finally``, so the permit comes back on every path a connection can end
+        on -- a completed exchange, a peer that disappeared, an expired idle
+        timeout, or a handler error the base class routes to ``handle_error`` --
+        and the ceiling can never erode.
+
+        :param request: the accepted connection socket.
+        :param client_address: the peer address, as :mod:`socketserver` supplies it.
+        """
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            self._admission.release()
 
 
 # Address resolution
