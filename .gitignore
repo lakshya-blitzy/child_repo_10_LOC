@@ -1,0 +1,70 @@
+# Git ignore rules for child_repo_10_LOC -- the Level 2, Python tier of this
+# composition, which serves /health on port 8000.
+#
+# Scope: local execution residue, and nothing else. This tier runs on the
+# standard library alone -- no third-party package, no virtual environment, no
+# build tool and no packaging step lives in the working tree -- so the only files
+# a run, test and serve cycle can leave behind are CPython's bytecode caches,
+# plus a machine-local `.env` an operator may keep beside the tracked
+# `.env.example` template. `health.py` and `server.py` write no file at all.
+#
+# Why this file is required rather than merely tidy: importing `app.py`,
+# `health.py` or `server.py` makes CPython cache the module beside its source,
+# which materializes `child_repo_10_LOC/__pycache__/`. Acceptance criterion AC-13
+# and quality gate G7 require `git status --porcelain --untracked-files=all` to be
+# empty at this tier after a full cycle, so the residue is ignored rather than
+# deleted afterwards: deleting a directory races a concurrent `git status`, not
+# creating an entry for it cannot.
+#
+# Every pattern below is narrow on purpose, because every file at this tier is
+# tracked deliberately -- `app.py`, `health.py`, `server.py`, `test_app.py`,
+# `pyproject.toml`, `.python-version`, `.env.example`, `config/health.json`,
+# `Dockerfile`, `.dockerignore`, `README.md`, `.gitmodules`, this file, the
+# workflow under `.github/`, and the `nested_child_repo_10_LOC` gitlink. A broad
+# pattern (`*.py`, `*.json`, `*.toml`, `config/`, `.env*`, `test*`, `Dockerfile*`,
+# `.github/`, `.*`) would silently untrack one of them.
+#
+# `nested_child_repo_10_LOC` in particular is a TRACKED gitlink and first-class
+# project source, so it is never named or matched here. The sibling
+# `.dockerignore` does exclude it, and that is correct: keeping a repository out
+# of one image's build context and dropping it from version control are different
+# concerns with different right answers. The same holds for `test_app.py`,
+# `.github` and `Dockerfile`, which that file excludes and this one must not.
+#
+# Each tier ignores only its own language's residue -- the apex JavaScript tier
+# `node_modules/`, the nested Java tier `*.class` -- so the three files are
+# deliberately different and are not merged into one template.
+
+# CPython bytecode caches.
+#
+# `__pycache__/` is the directory the interpreter actually creates. The trailing
+# slash matches directories only, and the absence of an interior slash applies the
+# pattern at every depth, so a cache beside a future module under `config/` is
+# covered by the same line. Git does not descend into an ignored directory, so its
+# contents need no pattern of their own.
+#
+# `*.pyc` is the second line of defense, for a cache file written beside its
+# source instead of inside `__pycache__/` -- a sourceless or legacy layout, or a
+# file copied out of the cache directory for inspection -- which a directory
+# pattern cannot reach.
+#
+# `*.pyo` and `*.pyd` are deliberately absent rather than overlooked: PEP 488
+# removed `.pyo` in CPython 3.5, and this tier floors at 3.11 (`pyproject.toml`,
+# set by `tomllib`) and pins 3.14.6 (`.python-version`), so no interpreter that can
+# run this code writes one; `.pyd` is a Windows extension-module binary, and this
+# tier compiles nothing and depends on nothing.
+__pycache__/
+*.pyc
+
+# A machine-local environment file.
+#
+# `HEALTH_PORT` and `HEALTH_HOST` are read from `os.environ` and never from a
+# dotenv file -- nothing here parses one -- but an operator may keep a local
+# `.env` for reference, and it stays out of version control whatever it holds
+# (ST-1 / G8). No credential belongs in this repository.
+#
+# The pattern is the exact name and deliberately not `.env*`: `.env.example` is
+# the tracked template that documents both overrides, and the broad form would
+# ignore it unless immediately followed by a `!.env.example` negation. Not needing
+# the negation is safer than getting it right.
+.env
