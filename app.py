@@ -47,19 +47,16 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         self._route()
 
     # Returning True without writing anything skips the interim 100 Continue
-    # the base class sends as soon as the header is parsed, which would grant
-    # an upload before the path and the method had been looked at. Routing
-    # answers straight away instead, and that response closes the connection,
-    # so a body the client may still send is discarded rather than read.
+    # the base class would send as soon as the header was parsed, granting an
+    # upload before the path and the method had been looked at. The routed
+    # answer goes out instead, and closing discards whatever still arrives.
     def handle_expect_100(self):
         return True
 
-    # Discards the access log, the one sink that sees raw request text: the
-    # base class writes the request line -- method, path and query string
-    # exactly as they arrived -- to stderr, so a probe of /health?token=...
-    # would copy caller-supplied data, control characters included, into the
-    # operator's log (CWE-532). Nothing here writes to stdout, so the startup
-    # banner and the default program's greeting are unaffected.
+    # Discards the access log, the one sink that would see raw request text:
+    # the base class copies the request line to stderr verbatim, so a probe of
+    # /health?token=... would write caller-supplied data, control characters
+    # included, into the operator's log (CWE-532).
     def log_message(self, fmt, *args):
         pass
 
@@ -70,13 +67,10 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     def send_error(self, code, message=None, explain=None):
         status = code
         if status == HTTPStatus.NOT_IMPLEMENTED:
-            # An unrecognised verb never reaches _route, because the base class
-            # answers a missing do_* handler with 501 before any routing
-            # happens, so the path decision is repeated here to keep both
-            # entry points in the same order -- path first, method second, as
-            # the siblings do. Every other status arrives from a request line
-            # the base class could not parse, where no trustworthy path
-            # exists, so those keep the code they came with.
+            # The base class answers a missing do_* handler with 501 before
+            # any routing happens, so the path decision is repeated here to
+            # keep both entry points in the same order, path first. Every
+            # other status came from a line that never parsed, so it stands.
             if self._request_path() == HEALTH_PATH:
                 status = HTTPStatus.METHOD_NOT_ALLOWED
             else:
@@ -91,16 +85,22 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
             extra_headers = {"Allow": ALLOWED_METHODS}
         self._send_json(status, {"error": reason}, extra_headers)
 
-    # ``path`` is assigned only once a request line has been accepted, so an
-    # error raised while parsing that line can reach send_error before the
-    # attribute exists; a missing value matches no route and resolves to the
-    # 404 envelope.
+    # The target comes from the raw request line, not from ``path``: the base
+    # class collapses a leading run of slashes there, so //health would arrive
+    # as /health and be answered 200 where the siblings answer 404. The line is
+    # split as the base class splits it and the target is its second field; a
+    # line that never parsed leaves none, which matches no route.
     def _request_path(self):
-        raw = getattr(self, "path", None)
-        if not isinstance(raw, str):
+        line = getattr(self, "requestline", None)
+        if not isinstance(line, str):
+            return None
+        fields = line.split()
+        if not 2 <= len(fields) <= 3:
             return None
         # Query and fragment are stripped so /health?probe=lb still matches.
-        return raw.split("?", 1)[0].split("#", 1)[0]
+        # Nothing else is: the target is never percent-decoded, so no encoded
+        # spelling of the route is mistaken for the route.
+        return fields[1].split("?", 1)[0].split("#", 1)[0]
 
     def _route(self):
         if self._request_path() != HEALTH_PATH:
@@ -112,13 +112,19 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
 
     def _send_json(self, status, body, extra_headers=None):
         payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
-        # Every response ends its connection. This endpoint reads no request
-        # body, and a persistent connection left holding unread body bytes
-        # lets those bytes be parsed as the next request on the same stream,
-        # so a POST whose body spelled out a GET /health drew two answers
-        # where one was asked for (CWE-444). The attribute is what the base
-        # class's request loop actually reads, so it is set here as well as
-        # announced in the header below.
+        # The base class suppresses the status line and every header while the
+        # recorded version is HTTP/0.9, which it still is for a request line it
+        # rejected before reading the version - "GET /health HTTP/2.0" among
+        # them. Answering in HTTP/1.1 keeps every response a complete message
+        # instead of a naked body no caller could attribute to a status.
+        if self.request_version == "HTTP/0.9":
+            self.request_version = self.protocol_version
+        # Every response ends its connection, which is the policy all three
+        # applications of this composition share: this endpoint reads no
+        # request body, and a connection reused while holding unread body
+        # bytes lets those bytes be parsed as the next request (CWE-444). The
+        # attribute is what the base class's request loop reads, so it is set
+        # here as well as announced in the header below.
         self.close_connection = True
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
@@ -147,13 +153,19 @@ def create_server(host=None, port=None):
         configured_host = os.environ.get("HOST", "").strip()
         host = configured_host or DEFAULT_HOST
     if port is None:
-        try:
-            # An unset, empty or malformed PORT falls back to the default
-            # instead of raising at start-up.
-            port = int(os.environ.get("PORT", ""))
-        except ValueError:
+        # An unset, blank, non-numeric or out-of-range PORT falls back to the
+        # default instead of raising at start-up. Only ASCII digits pass, so
+        # the siblings resolve the same value from the same string: int() alone
+        # would also take "+1234", "1_234" and non-ASCII digits, which they do
+        # not.
+        configured_port = os.environ.get("PORT", "").strip()
+        if configured_port and all(
+            character in "0123456789" for character in configured_port
+        ):
+            port = int(configured_port)
+        else:
             port = DEFAULT_PORT
-        if not 0 <= port <= 65535:
+        if port > 65535:
             port = DEFAULT_PORT
     return ThreadingHTTPServer((host, port), HealthRequestHandler)
 
@@ -162,11 +174,9 @@ def serve():
     try:
         server = create_server()
     except OSError:
-        # A bind failure -- an unresolvable HOST, an address this machine does
-        # not own, a port already in use -- would otherwise print a traceback
-        # carrying absolute repository paths and standard-library internals,
-        # so it is reported as one fixed sentence naming the variables to
-        # check, never their values.
+        # A bind failure would otherwise print a traceback carrying absolute
+        # repository paths and standard-library internals, so it is reported as
+        # one fixed sentence naming the variables to check, never their values.
         print(
             f"{APP_NAME} {APP_VERSION} could not bind the health endpoint;"
             " check HOST and PORT",
