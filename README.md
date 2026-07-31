@@ -28,7 +28,7 @@ This repository in turn **consumes the nested child, `nested_child_repo_10_LOC`*
 
 This repository is also **independently cloneable** from the URL the apex declares for it, `https://github.com/lakshya-blitzy/child_repo_10_LOC.git`.
 
-`app.py` holds the whole of this repository's code: one function and two script-entry guards `[app.py:L1-L18]`. The three programs in the composition are **independent, with no runtime coupling between the levels**. Nothing here imports, invokes, or is invoked by the apex JavaScript program or the nested child's Java program, and the only interface any of the three exposes is standard output. The composition as a whole, and the authoritative recursive acquisition order across all three levels, is documented in the apex README.
+`app.py` holds the whole of this repository's code: one function and two script-entry guards `[app.py:L1-L18]`. The three programs in the composition are **independent, with no runtime coupling between the levels**. Nothing here imports, invokes, or is invoked by the apex JavaScript program or the nested child's Java program, and the only interface any of the three exposes is standard output.
 
 ## Setup Instructions
 
@@ -42,7 +42,7 @@ Setup is acquisition only. No file in this repository declares a dependency — 
 
 Nothing in the composition declares a Python version or a toolchain version, so **no concrete interpreter version is asserted here**. 3.6 is the floor the source itself implies, because that is the release in which f-strings became available. That is a statement about the language level alone, and **not** a statement that the module runs — it does not. The mis-indented guard at `[app.py:L15]` stops it parsing under any interpreter, and the measured failure is recorded under Deployment Guide and Known Issues below.
 
-Node.js is a prerequisite of the apex repository only, and a JDK of the nested child only. Each is documented in its own README rather than restated here.
+Node.js is a prerequisite of the apex repository only, and a JDK of the nested child only. Neither is a prerequisite of this repository, and neither is restated here.
 
 ### Standalone acquisition
 
