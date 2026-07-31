@@ -1,18 +1,3 @@
-"""Greeting helper plus a read-only ``GET /health`` endpoint.
-
-Importing this module has no side effect. Run it with no arguments and it
-prints the greeting exactly as it always has; run it with ``--serve`` and it
-starts an HTTP listener that answers ``GET`` and ``HEAD`` on ``/health`` with a
-compact JSON document reporting the application name, version, the current UTC
-instant and a status of ``UP``. The optional ``HOST`` and ``PORT`` environment
-variables override the bind address.
-
-The listener is built on :mod:`http.server`, which the standard library
-documents as not recommended for production. That caveat is mitigated here by
-defaulting the bind address to loopback and by keeping the response body to the
-four documented fields, so nothing about the host or the runtime is disclosed.
-"""
-
 import json
 import os
 import sys
@@ -23,8 +8,8 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 APP_NAME = "child_repo_10_LOC"
 APP_VERSION = "1.0.0"
 HEALTH_PATH = "/health"
-# Emitted verbatim as the ``Allow`` header value. The sibling implementations
-# emit the identical string, so the exact ", " spacing is part of the contract.
+# The sibling implementations emit the identical string, so the exact ", "
+# spacing is part of the contract.
 ALLOWED_METHODS = "GET, HEAD"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
@@ -35,12 +20,10 @@ def greet(name):
 
 
 def current_timestamp():
-    """Return the current UTC instant as ``YYYY-MM-DDTHH:MM:SSZ``."""
     return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def health_payload():
-    """Build the health document as a fresh dict in wire key order."""
     return {
         "name": APP_NAME,
         "version": APP_VERSION,
@@ -50,7 +33,6 @@ def health_payload():
 
 
 class HealthRequestHandler(BaseHTTPRequestHandler):
-    """Answer ``GET`` and ``HEAD`` on ``/health``, always in JSON."""
 
     protocol_version = "HTTP/1.1"
     server_version = f"{APP_NAME}/{APP_VERSION}"
@@ -59,27 +41,46 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     sys_version = ""
 
     def do_GET(self):
-        """Serve the health document."""
         self._route()
 
     def do_HEAD(self):
-        """Serve the health headers; RFC 9110 expects HEAD alongside GET."""
         self._route()
 
-    def send_error(self, code, message=None, explain=None):
-        """Keep every error response JSON and free of request-derived text.
+    # Returning True without writing anything skips the interim 100 Continue
+    # the base class sends as soon as the header is parsed, which would grant
+    # an upload before the path and the method had been looked at. Routing
+    # answers straight away instead, and that response closes the connection,
+    # so a body the client may still send is discarded rather than read.
+    def handle_expect_100(self):
+        return True
 
-        Overriding the base implementation is what stops an unsupported verb
-        receiving the stock ``501`` HTML page, whose body repeats the request
-        method back to the caller. ``message`` and ``explain`` are ignored for
-        exactly that reason: the reason phrase is derived from the status code
-        alone, never from the request.
-        """
+    # Discards the access log, the one sink that sees raw request text: the
+    # base class writes the request line -- method, path and query string
+    # exactly as they arrived -- to stderr, so a probe of /health?token=...
+    # would copy caller-supplied data, control characters included, into the
+    # operator's log (CWE-532). Nothing here writes to stdout, so the startup
+    # banner and the default program's greeting are unaffected.
+    def log_message(self, fmt, *args):
+        pass
+
+    # Overriding this is what stops an unsupported verb receiving the stock 501
+    # HTML page, whose body repeats the request method back to the caller.
+    # ``message`` and ``explain`` are ignored for the same reason: the reason
+    # phrase is derived from the status code alone, never from the request.
+    def send_error(self, code, message=None, explain=None):
         status = code
         if status == HTTPStatus.NOT_IMPLEMENTED:
-            # An unrecognised verb is a method this endpoint refuses, not a gap
-            # in the server, so it is reported with the permitted methods.
-            status = HTTPStatus.METHOD_NOT_ALLOWED
+            # An unrecognised verb never reaches _route, because the base class
+            # answers a missing do_* handler with 501 before any routing
+            # happens, so the path decision is repeated here to keep both
+            # entry points in the same order -- path first, method second, as
+            # the siblings do. Every other status arrives from a request line
+            # the base class could not parse, where no trustworthy path
+            # exists, so those keep the code they came with.
+            if self._request_path() == HEALTH_PATH:
+                status = HTTPStatus.METHOD_NOT_ALLOWED
+            else:
+                status = HTTPStatus.NOT_FOUND
         try:
             reason = HTTPStatus(status).phrase
         except ValueError:
@@ -90,12 +91,19 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
             extra_headers = {"Allow": ALLOWED_METHODS}
         self._send_json(status, {"error": reason}, extra_headers)
 
-    def _route(self):
-        """Dispatch on the request path; GET and HEAD both land here."""
+    # ``path`` is assigned only once a request line has been accepted, so an
+    # error raised while parsing that line can reach send_error before the
+    # attribute exists; a missing value matches no route and resolves to the
+    # 404 envelope.
+    def _request_path(self):
+        raw = getattr(self, "path", None)
+        if not isinstance(raw, str):
+            return None
         # Query and fragment are stripped so /health?probe=lb still matches.
-        path = self.path.split("?", 1)[0].split("#", 1)[0]
-        if path != HEALTH_PATH:
-            # Fixed literal body: the requested path is never reflected back.
+        return raw.split("?", 1)[0].split("#", 1)[0]
+
+    def _route(self):
+        if self._request_path() != HEALTH_PATH:
             self._send_json(
                 HTTPStatus.NOT_FOUND, {"error": HTTPStatus.NOT_FOUND.phrase}
             )
@@ -103,14 +111,22 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         self._send_json(HTTPStatus.OK, health_payload())
 
     def _send_json(self, status, body, extra_headers=None):
-        """Write ``body`` as compact JSON with an accurate Content-Length."""
         payload = json.dumps(body, separators=(",", ":")).encode("utf-8")
+        # Every response ends its connection. This endpoint reads no request
+        # body, and a persistent connection left holding unread body bytes
+        # lets those bytes be parsed as the next request on the same stream,
+        # so a POST whose body spelled out a GET /health drew two answers
+        # where one was asked for (CWE-444). The attribute is what the base
+        # class's request loop actually reads, so it is set here as well as
+        # announced in the header below.
+        self.close_connection = True
         self.send_response(status)
         self.send_header("Content-Type", "application/json")
         self.send_header("Content-Length", str(len(payload)))
         # The timestamp is generated per request, so a cached liveness answer
         # would be worse than none at all.
         self.send_header("Cache-Control", "no-store")
+        self.send_header("Connection", "close")
         if extra_headers:
             for header, value in extra_headers.items():
                 self.send_header(header, value)
@@ -120,18 +136,16 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
             self.wfile.write(payload)
 
 
+# Each argument is tested with ``is None`` rather than for truthiness, so an
+# explicit ``port=0`` reaches the socket and yields an ephemeral port.
 def create_server(host=None, port=None):
-    """Return an unstarted server bound to ``host`` and ``port``.
-
-    Each value is taken from the explicit argument, else the environment, else
-    the module default. The arguments are tested with ``is None`` rather than
-    for truthiness so an explicit ``port=0`` reaches the socket and yields an
-    ephemeral port, which is how a test suite binds without a fixed port.
-    """
     if host is None:
-        # An unset or empty HOST keeps the loopback default rather than
-        # exposing the listener on every interface.
-        host = os.environ.get("HOST") or DEFAULT_HOST
+        # The environment value is normalised before it reaches the socket: an
+        # unset, empty or whitespace-only HOST keeps the loopback default
+        # rather than exposing the listener on every interface or failing to
+        # bind at all, and a padded value is trimmed to the address it names.
+        configured_host = os.environ.get("HOST", "").strip()
+        host = configured_host or DEFAULT_HOST
     if port is None:
         try:
             # An unset, empty or malformed PORT falls back to the default
@@ -145,12 +159,25 @@ def create_server(host=None, port=None):
 
 
 def serve():
-    """Bind the health endpoint and serve it until interrupted."""
-    server = create_server()
+    try:
+        server = create_server()
+    except OSError:
+        # A bind failure -- an unresolvable HOST, an address this machine does
+        # not own, a port already in use -- would otherwise print a traceback
+        # carrying absolute repository paths and standard-library internals,
+        # so it is reported as one fixed sentence naming the variables to
+        # check, never their values.
+        print(
+            f"{APP_NAME} {APP_VERSION} could not bind the health endpoint;"
+            " check HOST and PORT",
+            file=sys.stderr,
+            flush=True,
+        )
+        raise SystemExit(1)
     host, port = server.server_address[:2]
     url = f"http://{host}:{port}{HEALTH_PATH}"
-    # flush=True: stdout is block-buffered when redirected, and the banner must
-    # not queue up behind the first access-log line.
+    # flush=True: stdout is block-buffered when redirected, so without it the
+    # banner would sit in the buffer while the endpoint was already answering.
     print(f"{APP_NAME} {APP_VERSION} listening on {url}", flush=True)
     try:
         server.serve_forever()
