@@ -66,6 +66,19 @@ Each submodule hop is a separate fetch against a separate remote, so the network
 
 Beside the tracked content listed above, a checkout also carries Git's own metadata, which is not project content: a `.git` directory in a standalone clone, and a `.git` file holding a `gitdir:` pointer when this repository is checked out as a submodule of the apex.
 
+### Confirming which revision a clone acquired
+
+Neither clone command above names a ref, so each checks out whatever ref the remote reports as its default, and that default is mutable state rather than a property of this document. Confirm which revision a clone produced by running `wc -l README.md` inside it: the revision this document is committed in reports `214`, while a README that predates this documentation reports `0`, because it holds a single heading line — the misspelled `# chile_repo_10_LOC` — with no trailing newline, and so no line feed for `wc` to count.
+
+If the count does not match, list the refs this remote publishes and the one its default resolves to:
+
+```bash
+git ls-remote --heads https://github.com/lakshya-blitzy/child_repo_10_LOC.git
+git ls-remote --symref https://github.com/lakshya-blitzy/child_repo_10_LOC.git HEAD
+```
+
+Pass the head that carries this documentation to `git clone --branch`, or fetch it into an existing clone and check it out, then re-run `git submodule update --init --recursive` so the nested working tree follows the pin that revision records. No ref name is quoted here because none is stable: this repository publishes no tag, and a branch head is mutable state that the commands above report authoritatively.
+
 ### The nested child's submodule declaration
 
 `.gitmodules` in this repository is the authoritative declaration of the nested child's submodule name, checkout path, and clone URL. The documentation reads it without ever editing it:
@@ -138,7 +151,7 @@ python3 app.py
 IndentationError: unindent does not match any outer indentation level
 ```
 
-`python3 -c "import app"` fails identically, so **the module cannot be imported either**.
+`python3 -c "import app"` fails for the same reason, so **the module cannot be imported either**.
 
 ### Syntax check
 
