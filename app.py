@@ -18,6 +18,20 @@ DEFAULT_PORT = 8000
 # instead of applying the documented fallback.
 MAX_PORT = 65535
 MAX_PORT_DIGITS = len(str(MAX_PORT))
+# The depth of the kernel's accept queue for this listener. The one workload a
+# health endpoint has is concurrent probes, and ``socketserver.TCPServer``
+# defaults ``request_queue_size`` to 5 -- a handful of simultaneous connections
+# fills it, after which the kernel refuses the rest (TcpExt ListenOverflows).
+# The caller then receives no answer at all rather than a truncated one, and
+# nothing is written to this process's stderr, so a monitoring system reads a
+# dropped answer as the application being down. 128 is deep enough that a burst
+# of probes queues instead of overflowing, and it stays under the host's
+# net.core.somaxconn, which is what the kernel silently clamps this value to.
+# The sibling implementations queue the same bursts without loss for the same
+# reason -- JavaScript's listen backlog defaults to 511 and Java's to the
+# platform default -- so this keeps the three at parity under load as well as
+# on the wire.
+LISTEN_BACKLOG = 128
 
 
 def greet(name):
@@ -226,6 +240,18 @@ def resolve_port(environ=None):
     return port
 
 
+class HealthHTTPServer(ThreadingHTTPServer):
+    """``ThreadingHTTPServer`` with an accept queue sized for concurrent probes.
+
+    ``request_queue_size`` is read by ``socketserver.TCPServer.server_activate``
+    while the socket is being put into the listening state, which happens inside
+    the constructor -- so it has to be a class attribute here rather than
+    something assigned to a server that already exists.
+    """
+
+    request_queue_size = LISTEN_BACKLOG
+
+
 # Tested with ``is None`` rather than for truthiness, so an explicit ``port=0``
 # reaches the socket and yields an ephemeral port.
 def create_server(host=None, port=None):
@@ -233,7 +259,7 @@ def create_server(host=None, port=None):
         host = resolve_host()
     if port is None:
         port = resolve_port()
-    return ThreadingHTTPServer((host, port), HealthRequestHandler)
+    return HealthHTTPServer((host, port), HealthRequestHandler)
 
 
 def serve():

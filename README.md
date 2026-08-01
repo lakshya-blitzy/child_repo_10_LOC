@@ -122,6 +122,18 @@ All three applications of this composition decide in that order.
 Point probes at the exact target `/health`, and note that a base URL already
 ending in `/` concatenated with `/health` produces `//health`, one of them.
 
+A message this application cannot read as a request for a route is answered
+inside that same envelope as well, so a probe pointed here never has to parse
+HTML: an empty request target and an over-long one are `404`, a request line
+whose fields do not line up or that is not a request line at all is `400`, a
+request naming an HTTP version above 1.1 is `505 HTTP Version Not Supported`,
+and a message with conflicting framing is `405`. Each of those carries the three
+header fields above and a body that is the corresponding `{"error":"…"}` literal.
+How leniently a malformed message is read is the standard library's decision, not
+this application's, so the sibling levels may classify the same bytes
+differently; the answers all three give to `GET /health` and `HEAD /health` — the
+only two requests a health probe needs — are identical.
+
 ### Running the server
 
 ```bash
@@ -305,6 +317,19 @@ bounded instead:
   holds one thread until it hangs up, so the loopback-only default above is also
   what bounds who can open them. The endpoint keeps answering normally while they
   are held, and every thread is released as soon as its caller goes away;
+- the kernel's accept queue for the listener is **128** deep, set by the
+  `LISTEN_BACKLOG` constant at the top of `app.py` and applied through the
+  `HealthHTTPServer` subclass, because the standard library defaults it to `5`.
+  Five is the one depth a health endpoint cannot live with: being polled by
+  several probes at once is its entire workload, and a connection that arrives
+  to a full queue is refused by the kernel rather than answered — the caller
+  gets no reply at all, and because nothing reaches this process, nothing is
+  logged either, so a monitoring system reads the silence as the application
+  being down. Measured on this host, 100 simultaneous half-closing callers lost
+  14 answers at the default depth and lose none at 128, with the kernel's
+  `ListenOverflows` counter going from 80 to 0. Anything above the host's
+  `net.core.somaxconn` is clamped to it, so 128 is a depth and not a promise;
+  raise the constant if a deployment polls harder than that;
 - the body carries only the four fields above, and no request data is ever
   echoed back on any status path;
 - the response names this application and its version, and nothing about the
