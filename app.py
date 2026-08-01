@@ -45,19 +45,12 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     protocol_version = "HTTP/1.1"
     server_version = f"{APP_NAME}/{APP_VERSION}"
     # Suppresses the interpreter version banner the base class would otherwise
-    # advertise in the ``Server`` header of every response.
+    # advertise in the ``Server`` header of every response. The base class joins
+    # ``server_version`` and ``sys_version`` with a space, so the field arrives
+    # as the application's name and version followed by that separator; RFC 9110
+    # excludes surrounding whitespace from a field value, so the value a
+    # recipient reads is exactly the name and version and nothing else.
     sys_version = ""
-
-    # Emptying ``sys_version`` is not enough on its own: the base class builds
-    # the field value as ``server_version + ' ' + sys_version``, so suppressing
-    # the banner leaves the value ending in the space that used to separate the
-    # two. RFC 9110 excludes leading and trailing whitespace from a field value,
-    # so that space is not part of what this endpoint means to send, and a
-    # recipient comparing the value as it arrived would not match the name and
-    # version the health document reports. Returning ``server_version`` alone
-    # sends exactly those and nothing else.
-    def version_string(self):
-        return self.server_version
 
     # The same absorption as _send_json below, one level out, because a peer
     # can also vanish while the base class is still reading: a connection
@@ -194,19 +187,27 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
             return
 
 
-def resolve_host():
+def resolve_host(environ=None):
     """Returns the bind address from ``HOST``, or the loopback default.
 
     The environment value is normalised before it can reach the socket: an
     unset, empty or whitespace-only ``HOST`` keeps the loopback default rather
     than exposing the listener on every interface or failing to bind at all,
     and a padded value is trimmed to the address it names.
+
+    ``environ`` names the mapping the variable is read from, and defaults to
+    the real environment. Reading it is separated from deciding what it means
+    so that the decision is a pure function of a mapping: every documented
+    form is then exercisable without a test having to write into the
+    process-wide ``os.environ``, which any concurrent thread would also see.
     """
-    configured = os.environ.get("HOST", "").strip()
+    if environ is None:
+        environ = os.environ
+    configured = environ.get("HOST", "").strip()
     return configured or DEFAULT_HOST
 
 
-def resolve_port():
+def resolve_port(environ=None):
     """Returns the listen port from ``PORT``, or the default. Never raises.
 
     Every invalid form -- unset, blank, non-numeric, signed, out of range, or
@@ -226,8 +227,13 @@ def resolve_port():
     ``Integer.parseInt`` overflows and falls back, and JavaScript's
     ``parseInt`` yields a value above ``MAX_PORT`` -- while a zero-padded value
     such as ``"000080"`` still resolves to 80 in all three.
+
+    ``environ`` names the mapping the variable is read from, for the reason
+    given on :func:`resolve_host`.
     """
-    configured = os.environ.get("PORT", "").strip()
+    if environ is None:
+        environ = os.environ
+    configured = environ.get("PORT", "").strip()
     if not configured or not all(
         character in "0123456789" for character in configured
     ):

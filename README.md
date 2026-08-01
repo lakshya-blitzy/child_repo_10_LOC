@@ -59,10 +59,18 @@ Every answer, success or error, carries the same three header fields:
 request, so a cached liveness answer would be worse than no answer at all; the
 directive stops any intermediary from retaining a stale one.
 
-Two further fields are sent. `Connection: close` — every answer ends its own
-connection — and a `Server` field naming this application and its version, which
-says nothing about the interpreter underneath it. Its value is exactly
-`child_repo_10_LOC/1.0.0`, with no trailing space to trim.
+Three further fields are sent. `Connection: close`, because every answer ends its
+own connection; `Date`, which the standard library writes for every response
+rather than this application, and which RFC 9110 asks of a server that has a
+clock; and a `Server` field naming this application and its version, which says
+nothing about the interpreter underneath it: it reads `child_repo_10_LOC/1.0.0`,
+where the stock handler would have appended `Python/3.x.y`. The standard library
+builds that last field by joining the application's name and version with the
+interpreter banner, which this handler empties, so the field arrives with the
+join's separating space still on the end. RFC 9110 excludes the whitespace around
+a field value from the value, so compare it as HTTP defines one rather than byte
+for byte. A `405` carries one field more, `Allow: GET, HEAD`, as the table below
+shows.
 
 ### Status semantics
 
@@ -111,13 +119,17 @@ needs no configuration at all.
 PORT=8000 python3 app.py --serve
 ```
 
-`PORT` is read as an unsigned run of ASCII decimal digits naming a value from
-`0` to `65535`; leading zeros are allowed, so `PORT=000080` names port 80. Every
-other value falls back to `8000` rather than failing to start — blank,
-non-numeric such as `8000abc`, signed such as `+8000`, out of range such as
-`65536`, and a digit run longer than a port could ever need, such as four
-thousand nines. None of them raises, so a malformed value never aborts start-up
-and never prints a traceback:
+`PORT` is read as an unsigned run of ASCII decimal digits, and it is the
+**significant** digits — whatever is left once any leading zeros are dropped —
+that have to name a value from `0` to `65535`. Leading zeros are ignored however
+many of them there are, so `PORT=000080` and a value padded with four thousand
+zeros both name port 80, while a value of nothing but zeros names port `0` and so
+requests an ephemeral one. Every value that fails that reading falls back to
+`8000` rather than failing to start — blank, non-numeric such as `8000abc`,
+signed such as `+8000`, separated such as `80_00`, fractional such as `8.5`,
+written in the digits of another script, and any significant run out of range,
+whether that is `65536`, `99999` or four thousand nines. None of them raises, so
+a malformed value never aborts start-up and never prints a traceback:
 
 ```bash
 PORT=65536 python3 app.py --serve   # binds 8000, the documented fallback
@@ -142,31 +154,48 @@ Hello Lakshya
 It prints that one line and exits `0`. The HTTP listener starts **only** when
 `--serve` is passed, which is the whole reason the flag exists: adding the
 endpoint changed no existing behaviour. Importing the module is side-effect free
-as well — `python3 -c "import app"` neither prints anything nor binds a socket.
-CPython does cache bytecode for whatever it imports, so run that check in the
-residue-free form given under **Keeping the tree clean** below.
+as well — `python3 -c "import app"` neither prints anything nor binds a socket,
+and the suite asserts both in a fresh interpreter. CPython does cache bytecode
+for whatever it imports, so run that check in the residue-free form given under
+**Keeping the tree clean** below.
 
 ### Tests
 
 The suite is run by hand from this directory; nothing runs it automatically.
 
 ```bash
-python3 -m unittest
+PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m unittest
 ```
+
+The cache prefix is part of the command, not a refinement of it. The runner
+imports `test_app.py` and `app.py` before any test code executes, and CPython
+writes their bytecode beside the sources by default — so a bare
+`python3 -m unittest` leaves an untracked `__pycache__` directory behind, in a
+repository whose working tree is expected to stay clean, and no test could
+prevent it. Directing the cache out of the tree is what keeps the run
+residue-free; `python3 -B -m unittest` and `PYTHONDONTWRITEBYTECODE=1` have the
+same effect by writing no bytecode at all. Bare `python3 -m unittest` still
+works and still passes — it is simply not clean-tree safe, so see **Keeping the
+tree clean** below if you use it.
 
 Default discovery finds `test_app.py` beside `app.py` and reports `Ran 6 tests`
 followed by `OK`: six tests across three cases, covering the pre-existing
 `greet` behaviour **and the no-argument program itself** — run in a real child
 process, with its standard output, its standard error and its exit status all
 compared byte for byte, so that `Hello Lakshya` is proven rather than assumed
-and a listener that started without the flag would fail the suite — the health
-document with its timestamp grammar, the `PORT` and `HOST` fallbacks for every
-malformed value, and the live endpoint over HTTP including `HEAD`, `404`, `405`
-and a caller that hangs up mid-exchange. It is built only from `unittest` and
-the rest of the standard library, and the server it exercises is bound on port
-`0`, so the suite takes an ephemeral port and never collides with a running
-`--serve`. The child process is started with `-B`, so it writes no bytecode of
-its own and the working tree stays as clean as the suite found it.
+and a listener that started without the flag would fail the suite — **and a
+fresh interpreter asked to do nothing but `import app`**, which must print
+nothing on either stream and exit `0`, so an import-time side effect fails the
+suite rather than hiding inside it. Beyond that: the health document with its
+timestamp grammar, the `PORT` and `HOST` fallbacks for every malformed value,
+and the live endpoint over HTTP including `HEAD`, `404`, `405` and a caller that
+hangs up mid-exchange. It is built only from `unittest` and the rest of the
+standard library, and the server it exercises is bound on port `0`, so the suite
+takes an ephemeral port and never collides with a running `--serve`. Every child
+process it starts is started with `-B`, so no child writes bytecode of its own,
+and no test writes into `os.environ`: the two resolvers are given the mapping
+they read, so a case cannot leak into the server thread, into a later test or
+into any process started afterwards.
 
 A syntax-only check, if that is all you need:
 
@@ -176,14 +205,13 @@ PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m py_compile app.py
 
 ### Keeping the tree clean
 
-Every command above that imports or compiles this module makes CPython write
-bytecode, and by default it lands in a `__pycache__` directory beside the
-sources — untracked files in a repository whose working tree is expected to stay
-clean. Either send the cache somewhere outside the tree, as the syntax check
-above does:
+Every command that imports or compiles this module makes CPython write bytecode,
+and by default it lands in a `__pycache__` directory beside the sources —
+untracked files in a repository whose working tree is expected to stay clean.
+The commands above already send that cache outside the tree; do the same for any
+other invocation:
 
 ```bash
-PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m unittest
 PYTHONPYCACHEPREFIX=/tmp/pycache python3 -c "import app"
 ```
 

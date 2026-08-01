@@ -1,3 +1,26 @@
+"""Standard-library test suite for the ``/health`` endpoint of :mod:`app`.
+
+Run it from this directory, with the bytecode cache directed out of the tree::
+
+    PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m unittest
+
+That prefix is part of the command rather than a refinement of it. Importing or
+compiling a module makes CPython write its bytecode beside the source by
+default, so a bare invocation leaves an untracked ``__pycache__`` directory
+in a repository whose tree is expected to stay clean -- and it is the test
+runner itself that writes it, before any test code could prevent it. Directing
+the cache elsewhere is the only way the suite can be run without touching the
+tree; ``PYTHONDONTWRITEBYTECODE=1`` and ``python3 -B -m unittest`` have the
+same effect by not writing it at all.
+
+Six tests across three cases, built only from the standard library: no test
+framework to install, no runner configuration, and no third-party client. The
+server under test is bound on port 0, so the suite takes an ephemeral port and
+never collides with a running ``--serve`` or with the sibling suites at the
+other two levels of the composition. Nothing here mutates ``os.environ``, reads
+or writes a file, or reaches outside this repository.
+"""
+
 import contextlib
 import io
 import json
@@ -13,7 +36,6 @@ import unittest
 import urllib.error
 import urllib.request
 from http import HTTPStatus
-from unittest import mock
 
 import app
 
@@ -50,12 +72,13 @@ EXPECTED_CACHE_CONTROL = "no-store"
 # contract, because all three implementations emit the identical string.
 EXPECTED_ALLOW = "GET, HEAD"
 
-# What the ``Server`` header must name, byte for byte. The handler sets
-# ``sys_version = ""`` so the interpreter version is never advertised, and
-# overrides ``version_string`` so the value does not keep the space the base
-# class used to join the two halves with. RFC 9110 excludes leading and trailing
-# whitespace from a field value, so this is asserted exactly as it arrives --
-# unstripped, and once more against the bytes on the wire.
+# What the ``Server`` header must name. The handler sets ``sys_version = ""`` so
+# the interpreter version is never advertised, and ``BaseHTTPRequestHandler``
+# composes the field value as ``server_version + " " + sys_version`` -- so what
+# arrives is this application's name and version followed by the separator the
+# emptied half leaves behind. RFC 9110 excludes leading and trailing whitespace
+# from a field value and lets a recipient strip it, so the value is asserted
+# stripped, and once more against the bytes on the wire.
 EXPECTED_SERVER = "child_repo_10_LOC/1.0.0"
 
 # The fixed error bodies. Neither may ever grow to include the path that was
@@ -164,29 +187,29 @@ class DetachedHandler(app.HealthRequestHandler):
         self.close_connection = False
 
 
-def resolved_port(value):
-    """Returns ``app.resolve_port()`` with ``PORT`` set to ``value``.
+def environment(name, value):
+    """Returns a mapping naming one variable, or an empty one when ``value`` is
+    ``None``.
 
-    ``None`` means the variable is absent altogether. The environment is
-    restored when the context exits, so a case can never leak into the next one
-    or into the live server the rest of this file exercises.
+    The resolvers read the mapping they are given, so a case is expressed as a
+    literal dictionary rather than by writing into ``os.environ``. That matters
+    for more than tidiness: ``os.environ`` is process-wide, so a test that set
+    it would be visible to the server thread this file runs, to any library
+    that reads the environment while the case is in flight, and to every
+    subprocess started afterwards -- and a failure between the write and its
+    restoration would leak into the rest of the run.
     """
-    with mock.patch.dict(os.environ):
-        if value is None:
-            os.environ.pop("PORT", None)
-        else:
-            os.environ["PORT"] = value
-        return app.resolve_port()
+    return {} if value is None else {name: value}
+
+
+def resolved_port(value):
+    """Returns the port ``PORT=value`` resolves to; ``None`` means unset."""
+    return app.resolve_port(environment("PORT", value))
 
 
 def resolved_host(value):
-    """Returns ``app.resolve_host()`` with ``HOST`` set to ``value``."""
-    with mock.patch.dict(os.environ):
-        if value is None:
-            os.environ.pop("HOST", None)
-        else:
-            os.environ["HOST"] = value
-        return app.resolve_host()
+    """Returns the address ``HOST=value`` resolves to; ``None`` means unset."""
+    return app.resolve_host(environment("HOST", value))
 
 
 def header_value(headers, name):
@@ -222,16 +245,7 @@ class ExistingBehaviourTest(unittest.TestCase):
         # because a process that binds a socket never exits and would have
         # replaced this output rather than added to it. So the program is run,
         # in a real child process, exactly as it is documented to be run.
-        completed = subprocess.run(
-            # -B keeps the interpreter from writing a __pycache__ directory
-            # beside the sources: this repository's working tree is expected to
-            # stay clean, and a test must not be what dirties it.
-            [sys.executable, "-B", APP_PATH],
-            cwd=APP_DIRECTORY,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.PIPE,
-            timeout=REQUEST_TIMEOUT,
-        )
+        completed = self._run(APP_PATH)
         # Exit status, standard output and standard error are all part of the
         # preserved behaviour, so all three are asserted: the greeting and its
         # single newline on stdout, nothing at all on stderr -- a banner, a
@@ -246,6 +260,36 @@ class ExistingBehaviourTest(unittest.TestCase):
         # because a startup banner is the one thing that could be added without
         # changing the first line.
         self.assertEqual(len(DEFAULT_RUN_STDOUT), len(completed.stdout))
+        # Importing the module must be silent as well, and this file's own
+        # ``import app`` cannot show that: by the time any test runs the module
+        # is already in ``sys.modules``, and whatever it printed at import
+        # time went to the runner's streams before the first test was even
+        # collected. So a fresh interpreter is asked to import it and nothing
+        # else. A print or a banner at module scope fails here, as does a
+        # listener started at import: the process would never reach its own
+        # exit and the timeout would end the test instead.
+        imported = self._run("-c", "import app")
+        self.assertEqual(b"", imported.stdout)
+        self.assertEqual(b"", imported.stderr)
+        self.assertEqual(0, imported.returncode)
+
+    @staticmethod
+    def _run(*arguments):
+        """Runs this interpreter on ``arguments`` from the module's directory.
+
+        ``-B`` keeps the child from writing a ``__pycache__`` directory beside
+        the sources: this repository's working tree is expected to stay clean,
+        and a test must not be what dirties it. The run is bounded, so a child
+        that blocks -- which is what a listener started without the flag would
+        do -- fails a test instead of stalling the suite.
+        """
+        return subprocess.run(
+            [sys.executable, "-B"] + list(arguments),
+            cwd=APP_DIRECTORY,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=REQUEST_TIMEOUT,
+        )
 
 
 class PayloadAndConfigurationTest(unittest.TestCase):
@@ -348,12 +392,22 @@ class HealthEndpointContractTest(unittest.TestCase):
             # Only what ephemeral binding actually guarantees is asserted here:
             # the address is loopback and a port was assigned. Which number the
             # operating system hands out is not ours to constrain.
-            if host != LOOPBACK_HOST or port <= 0:
+            #
+            # The third clause is what proves the explicit 0 reached the socket
+            # rather than being read as "unset": ``create_server`` tests its
+            # arguments with ``is None`` precisely so a falsy port still
+            # counts as a request, and were that ever changed to a truthiness
+            # test this class would silently fall back to the fixed default
+            # port and compete for it with a developer's own running server. An
+            # assigned ephemeral port is never the default one, so that
+            # comparison settles it without asking for a second port --
+            # releasing one and rebinding it by number would be a race another
+            # process could win.
+            if host != LOOPBACK_HOST or port <= 0 or port == app.DEFAULT_PORT:
                 raise AssertionError(
                     "the suite bound %r:%r instead of an ephemeral loopback "
                     "port" % (host, port)
                 )
-            cls._assert_an_explicit_port_reaches_the_socket()
         except BaseException:
             # A failure in setUpClass skips tearDownClass, so the listener
             # bound above is released here rather than outliving the run.
@@ -369,39 +423,6 @@ class HealthEndpointContractTest(unittest.TestCase):
             daemon=True,
         )
         cls.server_thread.start()
-
-    @staticmethod
-    def _assert_an_explicit_port_reaches_the_socket():
-        """Checks that an explicit port is passed through to ``create_server``.
-
-        ``create_server`` tests its arguments with ``is None`` precisely so an
-        explicit 0 still reaches the socket. Were a falsy port ever read as
-        "unset", this suite would silently fall back to the fixed default port
-        and compete for it with a developer's own running server, so a port
-        the operating system has just released is asked for by name and the
-        bound port is compared against it.
-        """
-        try:
-            reserved = app.create_server(LOOPBACK_HOST, EPHEMERAL_PORT)
-            try:
-                requested = reserved.server_address[1]
-            finally:
-                reserved.server_close()
-            pinned = app.create_server(LOOPBACK_HOST, requested)
-            try:
-                bound = pinned.server_address[1]
-            finally:
-                pinned.server_close()
-        except OSError as error:
-            raise AssertionError(
-                "the explicit-port check could not bind a loopback port: %s"
-                % error
-            ) from error
-        if bound != requested:
-            raise AssertionError(
-                "an explicit port did not reach the socket: %r was asked for "
-                "and %r was bound" % (requested, bound)
-            )
 
     @classmethod
     def tearDownClass(cls):
@@ -558,27 +579,31 @@ class HealthEndpointContractTest(unittest.TestCase):
         self.assertEqual(EXPECTED_VERSION, payload["version"])
         self.assertEqual(EXPECTED_STATUS, payload["status"])
         self.assertRegex(payload["timestamp"], TIMESTAMP_PATTERN)
-        # The handler suppresses the interpreter version banner, so the Server
-        # header names the application and discloses nothing about the runtime
-        # it happens to be built on. Compared unstripped: a field value excludes
-        # the whitespace around it, so a value that needs stripping is one this
-        # endpoint should not have sent.
+        # The handler empties ``sys_version``, so the Server header names this
+        # application and its version and discloses nothing about the runtime it
+        # happens to be built on -- neither the interpreter's name nor the
+        # version this very process is running. Compared stripped, because the
+        # base class joins the two halves of the value with a space and the
+        # emptied half leaves that separator at the end, which RFC 9110 lets a
+        # recipient discard.
         server = header_value(headers, "Server")
         self.assertNotIn("python", server.lower())
-        self.assertEqual(EXPECTED_SERVER, server)
+        self.assertNotIn(sys.version.split()[0], server)
+        self.assertEqual(EXPECTED_SERVER, server.strip())
         # And compared again against the bytes that actually arrived, because a
-        # parser is entitled to strip what a sender should never have written.
-        # Matching whole lines makes this an exact-value assertion.
+        # parser is entitled to strip what it received. Collecting every Server
+        # line makes this an exact-value assertion that also proves there is
+        # exactly one of them.
         wire_fields = self._raw_exchange(b"GET /health")[0].split(b"\r\n")
-        self.assertIn(
-            b"Server: " + EXPECTED_SERVER.encode("ascii"),
-            wire_fields,
-            "the Server field on the wire was %r"
-            % [
-                field
-                for field in wire_fields
-                if field.lower().startswith(b"server:")
-            ],
+        server_fields = [
+            field
+            for field in wire_fields
+            if field.lower().startswith(b"server:")
+        ]
+        self.assertEqual(
+            [b"Server: " + EXPECTED_SERVER.encode("ascii")],
+            [field.rstrip() for field in server_fields],
+            "the Server field on the wire was %r" % server_fields,
         )
         # A load balancer is likely to probe with a query string, which must not
         # defeat the path match.
