@@ -155,12 +155,17 @@ python3 -m unittest
 
 Default discovery finds `test_app.py` beside `app.py` and reports `Ran 6 tests`
 followed by `OK`: six tests across three cases, covering the pre-existing
-`greet` behaviour, the health document with its timestamp grammar, the `PORT`
-and `HOST` fallbacks for every malformed value, and the live endpoint over HTTP
-including `HEAD`, `404`, `405` and a caller that hangs up mid-exchange. It is
-built only from `unittest` and the rest of the standard library, and the server
-it exercises is bound on port `0`, so the suite takes an ephemeral port and
-never collides with a running `--serve`.
+`greet` behaviour **and the no-argument program itself** — run in a real child
+process, with its standard output, its standard error and its exit status all
+compared byte for byte, so that `Hello Lakshya` is proven rather than assumed
+and a listener that started without the flag would fail the suite — the health
+document with its timestamp grammar, the `PORT` and `HOST` fallbacks for every
+malformed value, and the live endpoint over HTTP including `HEAD`, `404`, `405`
+and a caller that hangs up mid-exchange. It is built only from `unittest` and
+the rest of the standard library, and the server it exercises is bound on port
+`0`, so the suite takes an ephemeral port and never collides with a running
+`--serve`. The child process is started with `-B`, so it writes no bytecode of
+its own and the working tree stays as clean as the suite found it.
 
 A syntax-only check, if that is all you need:
 

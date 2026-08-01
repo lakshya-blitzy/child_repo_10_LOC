@@ -5,6 +5,8 @@ import os
 import re
 import socket
 import struct
+import subprocess
+import sys
 import threading
 import time
 import unittest
@@ -78,6 +80,19 @@ REQUEST_TIMEOUT = 5
 # so the check polls up to this deadline rather than sleeping a fixed second.
 FRESHNESS_TIMEOUT = 5.0
 FRESHNESS_POLL_INTERVAL = 0.1
+
+# What ``python3 app.py`` must write, byte for byte, when it is given no
+# arguments: the greeting and a single newline from ``print``, and nothing else
+# on either stream. Compared as bytes rather than as text so that a stray
+# carriage return or a second line fails the comparison instead of being
+# normalised away by universal-newline decoding.
+DEFAULT_RUN_STDOUT = b"Hello Lakshya\n"
+
+# The module's own path, and the directory to run it from. Taken from the
+# imported module rather than from ``__file__`` so the assertion follows the
+# module under test wherever the suite is invoked from.
+APP_PATH = os.path.abspath(app.__file__)
+APP_DIRECTORY = os.path.dirname(APP_PATH)
 
 # One abort reproduces the disclosure this guards against; a handful proves it
 # without lengthening the run.
@@ -199,6 +214,36 @@ class ExistingBehaviourTest(unittest.TestCase):
         # one that matters; a second name proves the greeting is still built
         # from its argument rather than from a captured constant.
         self.assertEqual("Hello world", app.greet("world"))
+        # Calling greet() proves the function. It cannot prove the program: the
+        # ``if __name__ == "__main__":`` branch is what an operator actually
+        # runs, and it is the branch the ``--serve`` gate exists to protect,
+        # because a process that binds a socket never exits and would have
+        # replaced this output rather than added to it. So the program is run,
+        # in a real child process, exactly as it is documented to be run.
+        completed = subprocess.run(
+            # -B keeps the interpreter from writing a __pycache__ directory
+            # beside the sources: this repository's working tree is expected to
+            # stay clean, and a test must not be what dirties it.
+            [sys.executable, "-B", APP_PATH],
+            cwd=APP_DIRECTORY,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            timeout=REQUEST_TIMEOUT,
+        )
+        # Exit status, standard output and standard error are all part of the
+        # preserved behaviour, so all three are asserted: the greeting and its
+        # single newline on stdout, nothing at all on stderr -- a banner, a
+        # warning or a traceback there would be a change even with the right
+        # stdout -- and a clean exit.
+        self.assertEqual(DEFAULT_RUN_STDOUT, completed.stdout)
+        self.assertEqual(b"", completed.stderr)
+        self.assertEqual(0, completed.returncode)
+        # The listener must not start without the flag. Had it started, the run
+        # above would have blocked until the timeout instead of returning, so
+        # reaching this line already proves it; the byte count is asserted too,
+        # because a startup banner is the one thing that could be added without
+        # changing the first line.
+        self.assertEqual(len(DEFAULT_RUN_STDOUT), len(completed.stdout))
 
 
 class PayloadAndConfigurationTest(unittest.TestCase):
