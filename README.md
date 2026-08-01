@@ -61,7 +61,8 @@ directive stops any intermediary from retaining a stale one.
 
 Two further fields are sent. `Connection: close` — every answer ends its own
 connection — and a `Server` field naming this application and its version, which
-says nothing about the interpreter underneath it.
+says nothing about the interpreter underneath it. Its value is exactly
+`child_repo_10_LOC/1.0.0`, with no trailing space to trim.
 
 ### Status semantics
 
@@ -215,6 +216,11 @@ which this repository's zero-dependency posture rules out, so the exposure is
 bounded instead:
 
 - the listener binds `127.0.0.1` unless an operator sets `HOST`;
+- each connection is served by its own thread, which is what
+  `ThreadingHTTPServer` means: a caller that connects without sending anything
+  holds one thread until it hangs up, so the loopback-only default above is also
+  what bounds who can open them. The endpoint keeps answering normally while they
+  are held, and every thread is released as soon as its caller goes away;
 - the body carries only the four fields above, and no request data is ever
   echoed back on any status path;
 - the response names this application and its version, and nothing about the

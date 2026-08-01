@@ -50,10 +50,12 @@ EXPECTED_CACHE_CONTROL = "no-store"
 # contract, because all three implementations emit the identical string.
 EXPECTED_ALLOW = "GET, HEAD"
 
-# What the ``Server`` header must name. The handler sets ``sys_version = ""`` so
-# the interpreter version is never advertised, and the base class still joins the
-# two halves with a space, so the value carries one trailing space that is
-# stripped before comparison rather than asserted against.
+# What the ``Server`` header must name, byte for byte. The handler sets
+# ``sys_version = ""`` so the interpreter version is never advertised, and
+# overrides ``version_string`` so the value does not keep the space the base
+# class used to join the two halves with. RFC 9110 excludes leading and trailing
+# whitespace from a field value, so this is asserted exactly as it arrives --
+# unstripped, and once more against the bytes on the wire.
 EXPECTED_SERVER = "child_repo_10_LOC/1.0.0"
 
 # The fixed error bodies. Neither may ever grow to include the path that was
@@ -558,13 +560,26 @@ class HealthEndpointContractTest(unittest.TestCase):
         self.assertRegex(payload["timestamp"], TIMESTAMP_PATTERN)
         # The handler suppresses the interpreter version banner, so the Server
         # header names the application and discloses nothing about the runtime
-        # it happens to be built on.
+        # it happens to be built on. Compared unstripped: a field value excludes
+        # the whitespace around it, so a value that needs stripping is one this
+        # endpoint should not have sent.
         server = header_value(headers, "Server")
         self.assertNotIn("python", server.lower())
-        self.assertTrue(
-            server.startswith(EXPECTED_SERVER), "Server header was [%s]" % server
+        self.assertEqual(EXPECTED_SERVER, server)
+        # And compared again against the bytes that actually arrived, because a
+        # parser is entitled to strip what a sender should never have written.
+        # Matching whole lines makes this an exact-value assertion.
+        wire_fields = self._raw_exchange(b"GET /health")[0].split(b"\r\n")
+        self.assertIn(
+            b"Server: " + EXPECTED_SERVER.encode("ascii"),
+            wire_fields,
+            "the Server field on the wire was %r"
+            % [
+                field
+                for field in wire_fields
+                if field.lower().startswith(b"server:")
+            ],
         )
-        self.assertEqual(EXPECTED_SERVER, server.strip())
         # A load balancer is likely to probe with a query string, which must not
         # defeat the path match.
         probed_status, _, probed_raw = self._read("/health?probe=lb")

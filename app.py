@@ -48,6 +48,17 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     # advertise in the ``Server`` header of every response.
     sys_version = ""
 
+    # Emptying ``sys_version`` is not enough on its own: the base class builds
+    # the field value as ``server_version + ' ' + sys_version``, so suppressing
+    # the banner leaves the value ending in the space that used to separate the
+    # two. RFC 9110 excludes leading and trailing whitespace from a field value,
+    # so that space is not part of what this endpoint means to send, and a
+    # recipient comparing the value as it arrived would not match the name and
+    # version the health document reports. Returning ``server_version`` alone
+    # sends exactly those and nothing else.
+    def version_string(self):
+        return self.server_version
+
     # The same absorption as _send_json below, one level out, because a peer
     # can also vanish while the base class is still reading: a connection
     # opened and reset without a request, or reset part-way through the request
