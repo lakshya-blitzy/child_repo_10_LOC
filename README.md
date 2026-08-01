@@ -24,7 +24,7 @@ child_repo_10_LOC/
 
 This repository is **consumed as a submodule by the apex repository, `parent_repo_10_LOC`**, which records it as a **gitlink**: a tree entry with Git mode `160000` whose value is a single commit SHA of this repository rather than a file blob, so a composed checkout receives exactly the commit that pin names. The pin advances whenever the apex re-stages the `child_repo_10_LOC` path after a new commit is made here, which committing this documentation does, so read the recorded value from the apex with `git ls-tree HEAD child_repo_10_LOC`; the pin recorded before this documentation was added is `5687ef6c3fdbdf361df830fcd78a2dbdcdb2b80a`.
 
-This repository in turn **consumes the nested child, `nested_child_repo_10_LOC`**, through a gitlink of the same kind, declared in the `.gitmodules` file reproduced under Setup Instructions below and checked out at the path `nested_child_repo_10_LOC/`. Read the pin recorded here with `git ls-tree HEAD nested_child_repo_10_LOC`; it currently names `c5250c8affe7a0afe46b782895fd17a4cbae105a`, and the pin recorded before this documentation was added is `687f60b6c74818ac7cd14413840d73fdfb5fe450`.
+This repository in turn **consumes the nested child, `nested_child_repo_10_LOC`**, through a gitlink of the same kind, declared in the `.gitmodules` file reproduced under Setup Instructions below and checked out at the path `nested_child_repo_10_LOC/`. Read the pin recorded here with `git ls-tree HEAD nested_child_repo_10_LOC`; the pin recorded before this documentation was added is `687f60b6c74818ac7cd14413840d73fdfb5fe450`.
 
 This repository is also **independently cloneable** from the URL the apex declares for it, `https://github.com/lakshya-blitzy/child_repo_10_LOC.git`.
 
