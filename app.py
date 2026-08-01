@@ -13,6 +13,14 @@ HEALTH_PATH = "/health"
 ALLOWED_METHODS = "GET, HEAD"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
+# The largest port a TCP socket can name, and therefore the most decimal digits
+# a port can need once leading zeros are dropped. The digit bound is what keeps
+# a hostile PORT away from int(): CPython refuses to convert a digit run longer
+# than sys.get_int_max_str_digits() -- 4300 by default since 3.11 -- and raises
+# ValueError, which would abort start-up with a traceback naming this file's
+# absolute path instead of applying the documented fallback.
+MAX_PORT = 65535
+MAX_PORT_DIGITS = len(str(MAX_PORT))
 
 
 def greet(name):
@@ -39,6 +47,21 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
     # Suppresses the interpreter version banner the base class would otherwise
     # advertise in the ``Server`` header of every response.
     sys_version = ""
+
+    # The same absorption as _send_json below, one level out, because a peer
+    # can also vanish while the base class is still reading: a connection
+    # opened and reset without a request, or reset part-way through the request
+    # line, makes rfile.readline() raise inside handle_one_request, where no
+    # response-path guard can see it. Port scans and load-balancer probes do
+    # exactly that, and every one of them would otherwise print a peer address
+    # and a traceback to stderr. Only the peer-disconnect family is caught, so
+    # a defect in this handler still surfaces; the connection is marked closed
+    # and the request loop ends normally.
+    def handle(self):
+        try:
+            super().handle()
+        except ConnectionError:
+            self.close_connection = True
 
     def do_GET(self):
         self._route()
@@ -126,47 +149,95 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         # attribute is what the base class's request loop reads, so it is set
         # here as well as announced in the header below.
         self.close_connection = True
-        self.send_response(status)
-        self.send_header("Content-Type", "application/json")
-        self.send_header("Content-Length", str(len(payload)))
-        # The timestamp is generated per request, so a cached liveness answer
-        # would be worse than none at all.
-        self.send_header("Cache-Control", "no-store")
-        self.send_header("Connection", "close")
-        if extra_headers:
-            for header, value in extra_headers.items():
-                self.send_header(header, value)
-        self.end_headers()
-        # HEAD carries the GET headers, Content-Length included, but no body.
-        if self.command != "HEAD":
-            self.wfile.write(payload)
+        try:
+            self.send_response(status)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(payload)))
+            # The timestamp is generated per request, so a cached liveness
+            # answer would be worse than none at all.
+            self.send_header("Cache-Control", "no-store")
+            self.send_header("Connection", "close")
+            if extra_headers:
+                for header, value in extra_headers.items():
+                    self.send_header(header, value)
+            self.end_headers()
+            # HEAD carries the GET headers, Content-Length included, but no
+            # body.
+            if self.command != "HEAD":
+                self.wfile.write(payload)
+        except ConnectionError:
+            # A caller that closed or reset its connection before the answer
+            # was written leaves nothing to answer: the write fails, and left
+            # to propagate it reaches socketserver's default handle_error,
+            # which prints the peer's address and a full traceback to stderr
+            # (CWE-209, CWE-532) - the very disclosure log_message above exists
+            # to prevent. A liveness probe that hangs up is routine, not an
+            # error, so it is absorbed here and the connection simply ends.
+            #
+            # ConnectionError is exactly the peer-disconnect family and nothing
+            # wider: BrokenPipeError, ConnectionResetError,
+            # ConnectionAbortedError and ConnectionRefusedError are its only
+            # subclasses. A programming error in this handler is not one of
+            # them and still propagates, so this narrows the reporting of an
+            # expected event without ever silencing a defect.
+            return
+
+
+def resolve_host():
+    """Returns the bind address from ``HOST``, or the loopback default.
+
+    The environment value is normalised before it can reach the socket: an
+    unset, empty or whitespace-only ``HOST`` keeps the loopback default rather
+    than exposing the listener on every interface or failing to bind at all,
+    and a padded value is trimmed to the address it names.
+    """
+    configured = os.environ.get("HOST", "").strip()
+    return configured or DEFAULT_HOST
+
+
+def resolve_port():
+    """Returns the listen port from ``PORT``, or the default. Never raises.
+
+    Every invalid form -- unset, blank, non-numeric, signed, out of range, or
+    a digit run too long to be a port at all -- resolves to ``DEFAULT_PORT``,
+    so a malformed value can never abort start-up or print a traceback. ``0``
+    is honoured as a request for an ephemeral port.
+
+    Only ASCII digits pass the first screen, so the three applications of this
+    composition resolve the same value from the same string: ``int()`` alone
+    would also accept ``"+1234"``, ``"1_234"`` and non-ASCII digits, which the
+    JavaScript and Java siblings reject. Leading zeros are then dropped and
+    what remains is bounded to ``MAX_PORT_DIGITS`` *before* the conversion,
+    which is what keeps ``int()`` away from a digit run past CPython's
+    integer-string conversion limit: ``int("9" * 4301)`` raises ``ValueError``
+    on 3.11 and newer. The bound costs nothing in agreement with the siblings,
+    which reach the same verdict by other means -- Java's
+    ``Integer.parseInt`` overflows and falls back, and JavaScript's
+    ``parseInt`` yields a value above ``MAX_PORT`` -- while a zero-padded value
+    such as ``"000080"`` still resolves to 80 in all three.
+    """
+    configured = os.environ.get("PORT", "").strip()
+    if not configured or not all(
+        character in "0123456789" for character in configured
+    ):
+        return DEFAULT_PORT
+    digits = configured.lstrip("0")
+    if len(digits) > MAX_PORT_DIGITS:
+        return DEFAULT_PORT
+    # An all-zero value strips to the empty string and names port 0.
+    port = int(digits) if digits else 0
+    if port > MAX_PORT:
+        return DEFAULT_PORT
+    return port
 
 
 # Each argument is tested with ``is None`` rather than for truthiness, so an
 # explicit ``port=0`` reaches the socket and yields an ephemeral port.
 def create_server(host=None, port=None):
     if host is None:
-        # The environment value is normalised before it reaches the socket: an
-        # unset, empty or whitespace-only HOST keeps the loopback default
-        # rather than exposing the listener on every interface or failing to
-        # bind at all, and a padded value is trimmed to the address it names.
-        configured_host = os.environ.get("HOST", "").strip()
-        host = configured_host or DEFAULT_HOST
+        host = resolve_host()
     if port is None:
-        # An unset, blank, non-numeric or out-of-range PORT falls back to the
-        # default instead of raising at start-up. Only ASCII digits pass, so
-        # the siblings resolve the same value from the same string: int() alone
-        # would also take "+1234", "1_234" and non-ASCII digits, which they do
-        # not.
-        configured_port = os.environ.get("PORT", "").strip()
-        if configured_port and all(
-            character in "0123456789" for character in configured_port
-        ):
-            port = int(configured_port)
-        else:
-            port = DEFAULT_PORT
-        if port > 65535:
-            port = DEFAULT_PORT
+        port = resolve_port()
     return ThreadingHTTPServer((host, port), HealthRequestHandler)
 
 

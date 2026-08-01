@@ -110,8 +110,19 @@ needs no configuration at all.
 PORT=8000 python3 app.py --serve
 ```
 
-A blank, non-numeric or out-of-range `PORT` falls back to `8000` rather than
-failing to start, and a blank `HOST` falls back to loopback for the same reason.
+`PORT` is read as an unsigned run of ASCII decimal digits naming a value from
+`0` to `65535`; leading zeros are allowed, so `PORT=000080` names port 80. Every
+other value falls back to `8000` rather than failing to start — blank,
+non-numeric such as `8000abc`, signed such as `+8000`, out of range such as
+`65536`, and a digit run longer than a port could ever need, such as four
+thousand nines. None of them raises, so a malformed value never aborts start-up
+and never prints a traceback:
+
+```bash
+PORT=65536 python3 app.py --serve   # binds 8000, the documented fallback
+```
+
+A blank or whitespace-only `HOST` falls back to loopback for the same reason.
 The three applications of this composition default to different ports — 3000,
 8000 and 8080 — so all three can serve `/health` side by side on one host.
 
@@ -131,6 +142,8 @@ It prints that one line and exits `0`. The HTTP listener starts **only** when
 `--serve` is passed, which is the whole reason the flag exists: adding the
 endpoint changed no existing behaviour. Importing the module is side-effect free
 as well — `python3 -c "import app"` neither prints anything nor binds a socket.
+CPython does cache bytecode for whatever it imports, so run that check in the
+residue-free form given under **Keeping the tree clean** below.
 
 ### Tests
 
@@ -140,18 +153,43 @@ The suite is run by hand from this directory; nothing runs it automatically.
 python3 -m unittest
 ```
 
-Default discovery finds `test_app.py` beside `app.py` and runs 6 tests: the
-pre-existing `greet` behaviour, the health document and its timestamp grammar,
-and the live endpoint over HTTP including `HEAD`, `404` and `405`. It is built
-only from `unittest` and the rest of the standard library, and the server it
-exercises is bound on port `0`, so the suite takes an ephemeral port and never
-collides with a running `--serve`.
+Default discovery finds `test_app.py` beside `app.py` and reports `Ran 6 tests`
+followed by `OK`: six tests across three cases, covering the pre-existing
+`greet` behaviour, the health document with its timestamp grammar, the `PORT`
+and `HOST` fallbacks for every malformed value, and the live endpoint over HTTP
+including `HEAD`, `404`, `405` and a caller that hangs up mid-exchange. It is
+built only from `unittest` and the rest of the standard library, and the server
+it exercises is bound on port `0`, so the suite takes an ephemeral port and
+never collides with a running `--serve`.
 
 A syntax-only check, if that is all you need:
 
 ```bash
-python3 -m py_compile app.py
+PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m py_compile app.py
 ```
+
+### Keeping the tree clean
+
+Every command above that imports or compiles this module makes CPython write
+bytecode, and by default it lands in a `__pycache__` directory beside the
+sources — untracked files in a repository whose working tree is expected to stay
+clean. Either send the cache somewhere outside the tree, as the syntax check
+above does:
+
+```bash
+PYTHONPYCACHEPREFIX=/tmp/pycache python3 -m unittest
+PYTHONPYCACHEPREFIX=/tmp/pycache python3 -c "import app"
+```
+
+or delete what was written once you are finished:
+
+```bash
+rm -rf __pycache__
+```
+
+Nothing else needs tidying: the application writes no file of its own and the
+suite only binds a socket, so `git status --porcelain --untracked-files=all`
+should be empty again afterwards.
 
 ### Requirements
 
@@ -176,7 +214,11 @@ bounded instead:
   echoed back on any status path;
 - the response names this application and its version, and nothing about the
   runtime it happens to be built on;
-- the endpoint reads no request body and exposes no dynamic input path.
+- the endpoint reads no request body and exposes no dynamic input path;
+- nothing about a caller reaches the process output: the access log is
+  suppressed, and a caller who hangs up mid-exchange is absorbed silently rather
+  than reported with its address and a traceback, so `--serve` prints its single
+  startup banner and nothing else for as long as it runs.
 
 The nested submodule serves the same four-field `/health` contract from its own
 application; see `nested_child_repo_10_LOC/README.md` for its own commands and

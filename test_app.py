@@ -1,47 +1,17 @@
-"""Hand-run ``unittest`` suite for this repository's health endpoint.
-
-Two things are proved here. The first is that the application still does what it
-always did: ``greet`` is asserted for the first time in this repository's
-history, which only became possible once the duplicated ``__main__`` guard was
-removed from ``app.py`` and the module could be imported at all. The second is
-that ``GET /health`` honours the response contract shared by all three
-applications of this composition -- the four-field document, the three mandated
-headers, ``HEAD``, and the fixed error envelopes.
-
-Only the standard library is used, so this repository keeps its zero-dependency
-posture: no test framework, no HTTP client library, no runner configuration and
-nothing to install before the suite runs. ``socket`` is here for one assertion
-that no HTTP client can make -- proving that a ``HEAD`` response really put zero
-bytes on the wire -- because ``http.client`` discards a HEAD body without ever
-reporting it. Discovery is left to the defaults, which is why the file is named
-``test_app.py`` and sits beside ``app.py``:
-
-    python3 -m unittest          # from this directory: 6 tests, OK
-    python3 test_app.py          # the same suite, through the footer below
-
-The server under test is bound on port 0, so the operating system hands out an
-ephemeral port. That is what lets the suite run beside an already-running
-``python3 app.py --serve``, and beside the sibling suites at the other two
-levels of the composition, without ever colliding on a port. Nothing here reads
-or writes an environment variable, so a run never depends on the shell that
-started it, and nothing here calls ``app.serve()``, which would print a banner
-and block forever.
-
-Expected values are spelled out as literals rather than read back from ``app``.
-Asserting the published contract instead of mirroring the implementation is what
-lets this suite catch a change made on either side of it, and it is what keeps
-the three independent implementations of the same four-field payload -- one per
-level, because the three repositories share no code -- from drifting apart
-unnoticed.
-"""
-
+import contextlib
+import io
 import json
+import os
 import re
 import socket
+import struct
 import threading
+import time
 import unittest
 import urllib.error
 import urllib.request
+from http import HTTPStatus
+from unittest import mock
 
 import app
 
@@ -104,11 +74,102 @@ REJECTED_METHODS = (
 # the whole run. The same bound is reused for the teardown join.
 REQUEST_TIMEOUT = 5
 
+# A per-request timestamp only shows itself once a second boundary is crossed,
+# so the check polls up to this deadline rather than sleeping a fixed second.
+FRESHNESS_TIMEOUT = 5.0
+FRESHNESS_POLL_INTERVAL = 0.1
+
+# One abort reproduces the disclosure this guards against; a handful proves it
+# without lengthening the run.
+ABORT_ATTEMPTS = 8
+
 # The address the server under test is bound to. Port 0 is deliberate: the
 # operating system assigns an ephemeral port, and the port actually assigned is
 # read back from the bound server rather than assumed.
 LOOPBACK_HOST = "127.0.0.1"
 EPHEMERAL_PORT = 0
+
+# A ``PORT`` of nothing but digits that no port could ever need. It is the one
+# malformed form that reaches ``int()`` looking legitimate, because a digit run
+# beyond the interpreter's integer-conversion limit raises instead of parsing,
+# so the resolver has to reject it by length before converting it.
+OVERLONG_NUMERIC_PORT = "9" * 4301
+
+# Sends a TCP RST instead of a FIN when the socket is closed, which is how a
+# client that gives up mid-exchange really looks: a linger timeout of zero
+# discards whatever is still queued. A FIN alone would let the server finish
+# writing into a half-closed connection and prove nothing.
+ABORTING_LINGER = struct.pack("ii", 1, 0)
+
+# The peer-disconnect exceptions a response write can raise. All three are
+# ``ConnectionError`` subclasses, and each must be absorbed, not reported.
+PEER_DISCONNECT_ERRORS = (
+    BrokenPipeError(32, "Broken pipe"),
+    ConnectionResetError(104, "Connection reset by peer"),
+    ConnectionAbortedError(103, "Software caused connection abort"),
+)
+
+
+class AbortedPeerWriter:
+    """A ``wfile`` whose every write fails the way a reset peer's does.
+
+    The failure is raised on the first write, which is the header flush,
+    because that is where a real abort was measured to land.
+    """
+
+    def __init__(self, error):
+        self.error = error
+        self.writes = 0
+
+    def write(self, data):
+        self.writes += 1
+        raise self.error
+
+    def flush(self):
+        pass
+
+
+class DetachedHandler(app.HealthRequestHandler):
+    """The handler's response path with a stub writer instead of a socket.
+
+    ``BaseHTTPRequestHandler.__init__`` runs a whole request cycle against a
+    real connection, so it is deliberately not called: only the attributes the
+    response path reads are set. That makes the write failure happen exactly
+    when the test says it does, rather than depending on whether a real peer's
+    reset happens to win a race with the server's write.
+    """
+
+    def __init__(self, writer, command="GET"):
+        self.wfile = writer
+        self.command = command
+        self.requestline = "%s /health HTTP/1.1" % command
+        self.request_version = "HTTP/1.1"
+        self.close_connection = False
+
+
+def resolved_port(value):
+    """Returns ``app.resolve_port()`` with ``PORT`` set to ``value``.
+
+    ``None`` means the variable is absent altogether. The environment is
+    restored when the context exits, so a case can never leak into the next one
+    or into the live server the rest of this file exercises.
+    """
+    with mock.patch.dict(os.environ):
+        if value is None:
+            os.environ.pop("PORT", None)
+        else:
+            os.environ["PORT"] = value
+        return app.resolve_port()
+
+
+def resolved_host(value):
+    """Returns ``app.resolve_host()`` with ``HOST`` set to ``value``."""
+    with mock.patch.dict(os.environ):
+        if value is None:
+            os.environ.pop("HOST", None)
+        else:
+            os.environ["HOST"] = value
+        return app.resolve_host()
 
 
 def header_value(headers, name):
@@ -132,9 +193,7 @@ class ExistingBehaviourTest(unittest.TestCase):
 
     def test_the_original_greeting_is_unchanged(self):
         # The module's only pre-feature behaviour, and the mechanical guarantee
-        # that adding an endpoint preserved it. This could not be asserted at
-        # all until app.py became importable: py_compile used to exit 1 on the
-        # duplicated __main__ guard, so no test could reach greet.
+        # that adding an endpoint preserved it.
         self.assertEqual("Hello Lakshya", app.greet("Lakshya"))
         # The default program prints greet("Lakshya"), so that exact call is the
         # one that matters; a second name proves the greeting is still built
@@ -142,8 +201,15 @@ class ExistingBehaviourTest(unittest.TestCase):
         self.assertEqual("Hello world", app.greet("world"))
 
 
-class HealthPayloadTest(unittest.TestCase):
-    """The health document itself, asserted without involving HTTP at all."""
+class PayloadAndConfigurationTest(unittest.TestCase):
+    """Everything the module answers without involving HTTP at all.
+
+    That is the health document itself, and the two environment variables that
+    decide where its listener is placed. Both resolvers are pure functions of
+    the environment, which is what lets every malformed form be exercised here
+    rather than by starting a server on the default port and competing with
+    whatever else is on it.
+    """
 
     def test_the_health_payload_reports_the_four_contract_fields_in_order(self):
         payload = app.health_payload()
@@ -165,13 +231,54 @@ class HealthPayloadTest(unittest.TestCase):
         # caller, and a per-request timestamp is impossible if it did.
         payload["status"] = "DOWN"
         self.assertEqual(EXPECTED_STATUS, app.health_payload()["status"])
-
-    def test_the_timestamp_is_a_second_precision_utc_instant(self):
-        # Node truncates and Java truncates; Python formats. Three mechanisms,
-        # one grammar -- asserted here so this level cannot drift from the other
-        # two while still looking plausible on its own.
+        # The timestamp is one of the four fields, so the grammar it must be
+        # written in is asserted here too -- on the document and on the builder
+        # behind it: a second-precision UTC instant, Z-suffixed, with no
+        # milliseconds and no offset.
         self.assertRegex(app.current_timestamp(), TIMESTAMP_PATTERN)
         self.assertRegex(app.health_payload()["timestamp"], TIMESTAMP_PATTERN)
+
+    def test_a_malformed_port_or_host_falls_back_instead_of_raising(self):
+        # The value on the left, the port the endpoint must bind on the right.
+        # An operator who mistypes PORT gets a running endpoint on the
+        # documented default, never a traceback: the fallback is the whole
+        # contract here.
+        for configured, expected in (
+            (None, app.DEFAULT_PORT),       # unset
+            ("", app.DEFAULT_PORT),         # blank
+            ("   ", app.DEFAULT_PORT),      # whitespace only
+            ("abc", app.DEFAULT_PORT),      # not a number
+            ("8000abc", app.DEFAULT_PORT),  # trailing rubbish, not a prefix
+            ("+8000", app.DEFAULT_PORT),    # signed; the siblings agree
+            ("-1", app.DEFAULT_PORT),       # negative
+            ("80_00", app.DEFAULT_PORT),    # int() takes it; the wire must not
+            ("8.5", app.DEFAULT_PORT),      # not an integer
+            ("65536", app.DEFAULT_PORT),    # one past the last port
+            ("99999", app.DEFAULT_PORT),    # five digits, out-of-range value
+            # The regression this test exists for: all digits, far too many.
+            (OVERLONG_NUMERIC_PORT, app.DEFAULT_PORT),
+            ("8000", 8000),                 # the documented default itself
+            (" 8080 ", 8080),               # padded by a shell, trimmed here
+            ("0", 0),                       # an explicit ephemeral port
+            ("000080", 80),                 # zero-padded, as siblings read it
+            ("00000", 0),                   # all zeros still name port 0
+        ):
+            label = configured if configured is None else configured[:16]
+            with self.subTest(port=label):
+                self.assertEqual(expected, resolved_port(configured))
+        # The same fallback read from the other variable, and asserted in the
+        # same test because it is the same behaviour. Loopback unless an
+        # operator opts in: an unset or blank HOST must never be read as "every
+        # interface", which is the one mistake here that would put the endpoint
+        # on the network.
+        self.assertEqual(app.DEFAULT_HOST, resolved_host(None))
+        self.assertEqual(app.DEFAULT_HOST, resolved_host(""))
+        self.assertEqual(app.DEFAULT_HOST, resolved_host("   "))
+        self.assertEqual("127.0.0.1", app.DEFAULT_HOST)
+        # A named address is honoured, and a padded one is trimmed to the
+        # address it names rather than handed to the socket with its spaces.
+        self.assertEqual("127.0.0.2", resolved_host("127.0.0.2"))
+        self.assertEqual("127.0.0.2", resolved_host("  127.0.0.2  "))
 
 
 class HealthEndpointContractTest(unittest.TestCase):
@@ -182,29 +289,31 @@ class HealthEndpointContractTest(unittest.TestCase):
         # Explicit arguments, never the environment, so a run cannot depend on
         # the shell that started it. The class binds once for all three of its
         # tests.
-        cls.server = app.create_server(LOOPBACK_HOST, EPHEMERAL_PORT)
-        host, port = cls.server.server_address[:2]
+        try:
+            server = app.create_server(LOOPBACK_HOST, EPHEMERAL_PORT)
+        except OSError as error:
+            raise AssertionError(
+                "the suite could not bind an ephemeral loopback port: %s"
+                % (error,)
+            ) from error
+        try:
+            host, port = server.server_address[:2]
+            # Only what ephemeral binding actually guarantees is asserted here:
+            # the address is loopback and a port was assigned. Which number the
+            # operating system hands out is not ours to constrain.
+            if host != LOOPBACK_HOST or port <= 0:
+                raise AssertionError(
+                    "the suite bound %r:%r instead of an ephemeral loopback "
+                    "port" % (host, port)
+                )
+            cls._assert_an_explicit_port_reaches_the_socket()
+        except BaseException:
+            # A failure in setUpClass skips tearDownClass, so the listener
+            # bound above is released here rather than outliving the run.
+            server.server_close()
+            raise
+        cls.server = server
         cls.base_url = "http://%s:%d" % (host, port)
-        # The explicit 0 has to reach the socket -- create_server tests its
-        # arguments with ``is None`` precisely so that it does. Were 0 ever
-        # treated as "unset" instead, the suite would quietly fall back to the
-        # fixed default port and start competing for it with a developer's own
-        # running server, so both halves of the ephemeral property are checked
-        # before any request is made: the port handed out is not the default,
-        # and a second bind asking for 0 is given a different one.
-        if port <= 0 or port == app.DEFAULT_PORT:
-            raise AssertionError(
-                "an explicit ephemeral port was not honoured; the server bound "
-                "%r instead" % (port,)
-            )
-        spare = app.create_server(LOOPBACK_HOST, EPHEMERAL_PORT)
-        spare_port = spare.server_address[1]
-        spare.server_close()
-        if spare_port == port:
-            raise AssertionError(
-                "two ephemeral binds were given the same port %r, so the port "
-                "is fixed rather than assigned" % (spare_port,)
-            )
         # A daemon thread cannot keep the interpreter alive if a test raises
         # before teardown runs, so a failure can never hang the run.
         cls.server_thread = threading.Thread(
@@ -213,6 +322,39 @@ class HealthEndpointContractTest(unittest.TestCase):
             daemon=True,
         )
         cls.server_thread.start()
+
+    @staticmethod
+    def _assert_an_explicit_port_reaches_the_socket():
+        """Checks that an explicit port is passed through to ``create_server``.
+
+        ``create_server`` tests its arguments with ``is None`` precisely so an
+        explicit 0 still reaches the socket. Were a falsy port ever read as
+        "unset", this suite would silently fall back to the fixed default port
+        and compete for it with a developer's own running server, so a port
+        the operating system has just released is asked for by name and the
+        bound port is compared against it.
+        """
+        try:
+            reserved = app.create_server(LOOPBACK_HOST, EPHEMERAL_PORT)
+            try:
+                requested = reserved.server_address[1]
+            finally:
+                reserved.server_close()
+            pinned = app.create_server(LOOPBACK_HOST, requested)
+            try:
+                bound = pinned.server_address[1]
+            finally:
+                pinned.server_close()
+        except OSError as error:
+            raise AssertionError(
+                "the explicit-port check could not bind a loopback port: %s"
+                % error
+            ) from error
+        if bound != requested:
+            raise AssertionError(
+                "an explicit port did not reach the socket: %r was asked for "
+                "and %r was bound" % (requested, bound)
+            )
 
     @classmethod
     def tearDownClass(cls):
@@ -299,6 +441,48 @@ class HealthEndpointContractTest(unittest.TestCase):
         )
         return header_block, body
 
+    def _assert_the_common_headers(self, headers, body, context):
+        """Asserts the headers a refusal owes just as much as a success does.
+
+        A 404 or a 405 is still an answer from this endpoint, so it carries the
+        same media type, the same cache directive and a byte-accurate length --
+        and never the stock ``text/html`` error page.
+        """
+        content_type = header_value(headers, "Content-Type")
+        self.assertEqual(EXPECTED_MEDIA_TYPE, content_type, context)
+        self.assertNotIn("text/html", content_type, context)
+        self.assertEqual(
+            EXPECTED_CACHE_CONTROL,
+            header_value(headers, "Cache-Control"),
+            context,
+        )
+        announced_length = header_value(headers, "Content-Length")
+        self.assertNotEqual(
+            "", announced_length, "%s: Content-Length is mandatory" % context
+        )
+        self.assertEqual(len(body), int(announced_length), context)
+
+    def _await_a_later_timestamp(self, first):
+        """Polls ``/health`` until the reported second changes.
+
+        Grammar alone cannot tell a per-request timestamp from one captured
+        once at import time, so the answer has to be seen changing. The wait is
+        bounded and every polled answer is checked, so a stuck timestamp fails
+        the test instead of hanging the run.
+        """
+        deadline = time.monotonic() + FRESHNESS_TIMEOUT
+        while time.monotonic() < deadline:
+            time.sleep(FRESHNESS_POLL_INTERVAL)
+            _, _, raw = self._read("/health")
+            latest = json.loads(raw)["timestamp"]
+            self.assertRegex(latest, TIMESTAMP_PATTERN)
+            if latest != first:
+                return latest
+        self.fail(
+            "GET /health kept reporting %r for %s seconds, so the timestamp "
+            "is not generated per request" % (first, FRESHNESS_TIMEOUT)
+        )
+
     def test_get_health_responds_two_hundred_with_the_contract_envelope(self):
         status, headers, raw = self._read("/health")
         self.assertEqual(200, status)
@@ -341,6 +525,11 @@ class HealthEndpointContractTest(unittest.TestCase):
         probed_status, _, probed_raw = self._read("/health?probe=lb")
         self.assertEqual(200, probed_status)
         self.assertEqual(EXPECTED_KEYS, list(json.loads(probed_raw).keys()))
+        # The timestamp is generated per request, not once at import time, so a
+        # later answer must report a later second.
+        later = self._await_a_later_timestamp(payload["timestamp"])
+        self.assertRegex(later, TIMESTAMP_PATTERN)
+        self.assertNotEqual(payload["timestamp"], later)
 
     def test_head_health_returns_the_get_headers_without_a_body(self):
         # The length is compared against a real GET rather than a literal, so
@@ -389,12 +578,88 @@ class HealthEndpointContractTest(unittest.TestCase):
         )
         self.assertEqual(b"", wire_body)
 
-    def test_unknown_paths_and_unsupported_methods_return_fixed_json_envelopes(self):
+    def _abort(self, request=None):
+        """Opens a connection, optionally sends ``request``, then resets it.
+
+        ``SO_LINGER`` with a zero timeout is what turns the close into a TCP
+        RST rather than an orderly shutdown, so the server's next read or write
+        on that connection really fails. With ``request`` given, the abort
+        lands while the response is being written; without it, while the
+        request is still being read -- the two paths a giving-up probe takes.
+        """
+        connection = socket.create_connection(
+            self.server.server_address[:2], timeout=REQUEST_TIMEOUT
+        )
+        try:
+            if request is not None:
+                connection.sendall(request)
+            connection.setsockopt(
+                socket.SOL_SOCKET, socket.SO_LINGER, ABORTING_LINGER
+            )
+        finally:
+            connection.close()
+
+    def _wait_for_handlers(self, baseline_threads):
+        """Blocks until every handler thread the server started has ended."""
+        deadline = time.monotonic() + REQUEST_TIMEOUT
+        while (
+            threading.active_count() > baseline_threads
+            and time.monotonic() < deadline
+        ):
+            time.sleep(0.01)
+
+    def test_aborted_callers_and_refused_requests_disclose_nothing(self):
+        """Every way this endpoint answers a request it will not serve.
+
+        A caller that gives up mid-exchange, a path that is not the route and
+        a method the route does not allow are one property seen from three
+        angles: whatever this endpoint cannot answer, what it says back names
+        neither the request, nor the caller, nor the machine that answered. The
+        three parts below are, in order, the aborting caller over a real
+        socket, the fixed ``404`` and ``405`` envelopes, and the response
+        writer's own behaviour once the socket underneath it has gone.
+        """
+        # Part 1 -- a caller that hangs up mid-exchange. A probe that gives up
+        # is routine, but the write it interrupts raises, and an exception
+        # escaping the handler reaches socketserver's default handle_error,
+        # which prints the peer's address and a full traceback to standard
+        # error. Suppressing the access log does not cover that path.
+        host, port = self.server.server_address[:2]
+        request = (
+            b"GET /health HTTP/1.1\r\nHost: "
+            + ("%s:%d" % (host, port)).encode("ascii")
+            + b"\r\n\r\n"
+        )
+        baseline_threads = threading.active_count()
+        captured = io.StringIO()
+        # Standard error is captured rather than inspected afterwards because
+        # the disclosure under test is written there by socketserver's own
+        # handle_error: the peer's address on one line and a full traceback --
+        # absolute module paths included -- on the next.
+        with contextlib.redirect_stderr(captured):
+            for _ in range(ABORT_ATTEMPTS):
+                self._abort(request)
+            for _ in range(ABORT_ATTEMPTS):
+                self._abort()
+            # A normal request after the aborts proves the endpoint survived
+            # them, and because connections are accepted in order it also
+            # guarantees every aborted connection has already reached a handler
+            # thread by the time the wait below starts.
+            status, _, raw = self._read("/health")
+            self._wait_for_handlers(baseline_threads)
+        self.assertEqual(
+            "",
+            captured.getvalue(),
+            "an aborting client made the server write to standard error",
+        )
+        self.assertEqual(200, status)
+        self.assertEqual(EXPECTED_KEYS, list(json.loads(raw).keys()))
+        # Part 2 -- an unknown path, then every unsupported method: the two
+        # fixed JSON envelopes, asserted byte-for-byte because their whole
+        # purpose is to carry nothing that came in with the request.
         code, headers, body = self._read_error("/nope")
         self.assertEqual(404, code)
-        self.assertEqual(
-            EXPECTED_MEDIA_TYPE, header_value(headers, "Content-Type")
-        )
+        self._assert_the_common_headers(headers, body, "path /nope")
         self.assertEqual(NOT_FOUND_BODY, body)
         # An inbound request is untrusted input, and this endpoint is the first
         # the system has ever accepted, so the answer must not quote the
@@ -414,11 +679,35 @@ class HealthEndpointContractTest(unittest.TestCase):
             self.assertEqual(
                 EXPECTED_ALLOW, header_value(headers, "Allow"), context
             )
-            content_type = header_value(headers, "Content-Type")
-            self.assertEqual(EXPECTED_MEDIA_TYPE, content_type, context)
-            self.assertNotIn("text/html", content_type, context)
+            self._assert_the_common_headers(headers, body, context)
             self.assertEqual(METHOD_NOT_ALLOWED_BODY, body, context)
             self.assertNotIn(method.encode("ascii"), body, context)
+        # Part 3 -- the response writer with its socket replaced by a double,
+        # which is what makes the write fail exactly where this test says it
+        # does instead of depending on whether a real peer's reset wins a race
+        # with the server's write. Each peer-disconnect exception the write can
+        # raise is exercised in turn.
+        for error in PEER_DISCONNECT_ERRORS:
+            with self.subTest(error=type(error).__name__):
+                writer = AbortedPeerWriter(error)
+                handler = DetachedHandler(writer)
+                # No assertRaises: the point is that nothing comes back out.
+                # Were this to raise, the traceback would carry the peer
+                # address into the operator's log by way of handle_error.
+                handler._send_json(HTTPStatus.OK, app.health_payload())
+                # The write really was attempted, so the test is exercising the
+                # failure path rather than passing because nothing happened.
+                self.assertGreaterEqual(writer.writes, 1)
+                # The connection is marked closed, so the request loop ends
+                # instead of trying to read another request from a dead socket.
+                self.assertTrue(handler.close_connection)
+        # The guard has to stay narrow. A failure that is not a peer disconnect
+        # means something is wrong in this application, and hiding it would
+        # turn every future defect on the response path into a silent reply.
+        writer = AbortedPeerWriter(ValueError("not a peer disconnect"))
+        handler = DetachedHandler(writer)
+        with self.assertRaises(ValueError):
+            handler._send_json(HTTPStatus.OK, app.health_payload())
 
 
 if __name__ == "__main__":
