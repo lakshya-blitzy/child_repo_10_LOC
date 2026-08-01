@@ -325,11 +325,14 @@ bounded instead:
   to a full queue is refused by the kernel rather than answered — the caller
   gets no reply at all, and because nothing reaches this process, nothing is
   logged either, so a monitoring system reads the silence as the application
-  being down. Measured on this host, 100 simultaneous half-closing callers lost
-  14 answers at the default depth and lose none at 128, with the kernel's
-  `ListenOverflows` counter going from 80 to 0. Anything above the host's
-  `net.core.somaxconn` is clamped to it, so 128 is a depth and not a promise;
-  raise the constant if a deployment polls harder than that;
+  being down. Measured on this host, 100 simultaneous half-closing callers lose
+  between fourteen and twenty-three answers at the default depth across repeated
+  runs, and none at all at 128; the kernel's `ListenOverflows` counter moves by
+  eighty to a hundred and fifty at the default depth and by zero at 128. How many
+  are lost varies with the run, because it depends on how the kernel interleaves
+  the arrivals — that none are lost at 128 is what does not vary. Anything above
+  the host's `net.core.somaxconn` is clamped to it, so 128 is a depth and not a
+  promise; raise the constant if a deployment polls harder than that;
 - the body carries only the four fields above, and no request data is ever
   echoed back on any status path;
 - the response names this application and its version, and nothing about the
