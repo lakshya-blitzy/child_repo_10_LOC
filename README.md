@@ -80,11 +80,47 @@ shows.
 | `HEAD /health` | `200 OK`, the same headers (including the `Content-Length` a `GET` would return), and a zero-byte body |
 | Any other method on `/health` | `405 Method Not Allowed` with `Allow: GET, HEAD` and body `{"error":"Method Not Allowed"}` |
 | Any other path | `404 Not Found` with body `{"error":"Not Found"}` |
+| An HTTP/1.1 request with no `Host` field | `400 Bad Request` with body `{"error":"Bad Request"}` |
 
-Both error bodies are fixed strings. Neither ever repeats the path that was
-asked for or the method that was used, and neither is ever HTML. An unrecognised
-method — `OPTIONS`, or a verb invented on the spot — is answered `405` with the
-same JSON envelope and the same `Allow` field, never `501`.
+All three error bodies are fixed strings derived from the status code alone. None
+of them ever repeats the path that was asked for or the method that was used, and
+none of them is ever HTML. An unrecognised method — `OPTIONS`, or a verb invented
+on the spot — is answered `405` with the same JSON envelope and the same `Allow`
+field, never `501`. Only a `405` carries `Allow`: a `404` or a `400` would
+otherwise name a method that works on an address this endpoint does not serve.
+
+RFC 9112 requires every HTTP/1.1 request to carry a `Host` field, and one that
+does not is answered `400 Bad Request` with body `{"error":"Bad Request"}` before
+its target or its method is looked at — so an unrecognised verb sent without the
+field is a `400` and not a `405`. `http.server` does not enforce that requirement
+itself, so this application does, which is what keeps the answer inside the same
+contract as every other one: the same header fields, always `application/json`,
+and a body derived from the status code. HTTP/1.0 is held to no such rule and is
+served normally, and a field that arrived empty was still sent, so it is served
+too. The field name is matched case-insensitively, as RFC 9110 defines field
+names to compare. The JavaScript and Java applications of this composition answer
+this case identically, so a probe cannot tell the three apart by omitting it.
+
+### How the request target is matched
+
+The target is compared to `/health` exactly as it arrived on the request line,
+with only a query string or fragment removed. It is never percent-decoded, so
+`/%68ealth` is a different target rather than another spelling of the route, and
+it is never re-normalised: a run of slashes is never collapsed and a dot segment
+is never resolved, so `/health/`, `/HEALTH`, `//health`, `///health` and
+`/a/../health` are different targets too, as is the absolute form
+`http://host/health`. Each of them is answered `404` with the fixed envelope.
+
+The comparison deliberately does not use the `path` attribute `http.server`
+provides, which collapses a leading run of slashes — `//health` would arrive
+there as `/health` and be served from an address this application never
+advertised. The decision order is `Host`, then path, then method, so an unsupported
+method on a target that is not the route is answered `404` rather than `405`, and
+either of them sent without a `Host` field is answered `400` rather than either.
+All three applications of this composition decide in that order.
+
+Point probes at the exact target `/health`, and note that a base URL already
+ending in `/` concatenated with `/health` produces `//health`, one of them.
 
 ### Running the server
 
@@ -186,16 +222,36 @@ compared byte for byte, so that `Hello Lakshya` is proven rather than assumed
 and a listener that started without the flag would fail the suite — **and a
 fresh interpreter asked to do nothing but `import app`**, which must print
 nothing on either stream and exit `0`, so an import-time side effect fails the
-suite rather than hiding inside it. Beyond that: the health document with its
-timestamp grammar, the `PORT` and `HOST` fallbacks for every malformed value,
-and the live endpoint over HTTP including `HEAD`, `404`, `405` and a caller that
-hangs up mid-exchange. It is built only from `unittest` and the rest of the
-standard library, and the server it exercises is bound on port `0`, so the suite
-takes an ephemeral port and never collides with a running `--serve`. Every child
-process it starts is started with `-B`, so no child writes bytecode of its own,
-and no test writes into `os.environ`: the two resolvers are given the mapping
-they read, so a case cannot leak into the server thread, into a later test or
-into any process started afterwards.
+suite rather than hiding inside it.
+
+The other branch of that same gate is exercised the same way: `app.py --serve` is
+started as a child process with `PORT=0`, the port it announces in its startup
+banner is parsed out of that banner, and the contract is then asked for **on the
+port the child itself named** — a served `GET`, a bodiless `HEAD`, a `404`, a
+`405` with its `Allow` field and a `400` for a message with no `Host`. The child
+is then interrupted the way an operator interrupts it, with `SIGINT`, and its exit
+status, its remaining output, its standard error and the release of its port are
+all asserted. A process that printed a banner and died, or one that bound
+something other than what it announced, fails there rather than passing.
+
+Beyond that: the health document with its timestamp grammar, the `PORT` and
+`HOST` fallbacks for every malformed value, and the live endpoint over HTTP
+including `HEAD`, `404`, `405`, a caller that hangs up mid-exchange, and — over a
+raw socket, because no client library can send them — every target and every
+malformed message this contract has to refuse: `///health`, `//health`,
+`/a/../health`, the absolute form, an unsupported method on a path that is not the
+route, and an HTTP/1.1 request with no `Host` field. Each is checked for its
+status, for the fixed body it owes, for the absence of `Allow` where none is due,
+and for carrying nothing back from the request that produced it.
+
+It is built only from `unittest` and the rest of the standard library, and every
+server it binds — the one it hosts in-process and the `--serve` child — is bound
+on port `0`, so the suite takes ephemeral ports and never collides with a running
+`--serve`. Every child process it starts is started with `-B`, so no child writes
+bytecode of its own, and no test writes into `os.environ`: the two resolvers are
+given the mapping they read and the `--serve` child is given a copy, so a case
+cannot leak into the server thread, into a later test or into any process started
+afterwards.
 
 A syntax-only check, if that is all you need:
 

@@ -11,6 +11,13 @@ HEALTH_PATH = "/health"
 # The sibling implementations emit the identical string, so the exact ", "
 # spacing is part of the contract.
 ALLOWED_METHODS = "GET, HEAD"
+# The only HTTP version whose messages must carry a ``Host`` field: RFC 9112
+# requires one of every HTTP/1.1 request and none of an HTTP/1.0 one. The
+# handler below refuses the former with the same fixed JSON 400 the JavaScript
+# and Java siblings send, so the composition has one malformed-request answer
+# rather than three.
+HTTP_1_1 = "HTTP/1.1"
+HOST_FIELD = "Host"
 DEFAULT_HOST = "127.0.0.1"
 DEFAULT_PORT = 8000
 # The largest port a TCP socket can name, and therefore the most decimal digits
@@ -42,7 +49,7 @@ def health_payload():
 
 class HealthRequestHandler(BaseHTTPRequestHandler):
 
-    protocol_version = "HTTP/1.1"
+    protocol_version = HTTP_1_1
     server_version = f"{APP_NAME}/{APP_VERSION}"
     # Suppresses the interpreter version banner the base class would otherwise
     # advertise in the ``Server`` header of every response. The base class joins
@@ -95,10 +102,15 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         status = code
         if status == HTTPStatus.NOT_IMPLEMENTED:
             # The base class answers a missing do_* handler with 501 before
-            # any routing happens, so the path decision is repeated here to
-            # keep both entry points in the same order, path first. Every
-            # other status came from a line that never parsed, so it stands.
-            if self._request_path() == HEALTH_PATH:
+            # any routing happens, so the routing decision is repeated here to
+            # keep both entry points in the same order -- Host, then path, then
+            # the method that brought us here. An unrecognised verb sent without
+            # a Host field is therefore answered 400 by this application just as
+            # a GET without one is, and as both siblings answer it. Every other
+            # status came from a line that never parsed, so it stands.
+            if self._lacks_host():
+                status = HTTPStatus.BAD_REQUEST
+            elif self._request_path() == HEALTH_PATH:
                 status = HTTPStatus.METHOD_NOT_ALLOWED
             else:
                 status = HTTPStatus.NOT_FOUND
@@ -129,7 +141,35 @@ class HealthRequestHandler(BaseHTTPRequestHandler):
         # spelling of the route is mistaken for the route.
         return fields[1].split("?", 1)[0].split("#", 1)[0]
 
+    # Whether an HTTP/1.1 request arrived without the ``Host`` field RFC 9112
+    # requires of one. ``http.server`` does not enforce that requirement, so the
+    # application does, and it does so before the target is looked at: a caller
+    # that omits the field gets one fixed JSON answer rather than a health
+    # document served to a request that never said which host it was for. An
+    # HTTP/1.0 message is held to no such rule, so only 1.1 is checked.
+    #
+    # ``headers`` is read through getattr because the response path is also
+    # reachable without a parsed request -- the base class rejects a malformed
+    # request line before that attribute exists -- and an absent header set is
+    # not evidence of a missing field. A field present but empty is not missing
+    # either, which is the same reading the JavaScript sibling applies to
+    # ``req.headers.host``; the lookup is case-insensitive because
+    # ``email.message`` matches field names as RFC 9110 says they compare.
+    def _lacks_host(self):
+        if self.request_version != HTTP_1_1:
+            return False
+        headers = getattr(self, "headers", None)
+        if headers is None:
+            return False
+        return headers.get(HOST_FIELD) is None
+
     def _route(self):
+        if self._lacks_host():
+            self._send_json(
+                HTTPStatus.BAD_REQUEST,
+                {"error": HTTPStatus.BAD_REQUEST.phrase},
+            )
+            return
         if self._request_path() != HEALTH_PATH:
             self._send_json(
                 HTTPStatus.NOT_FOUND, {"error": HTTPStatus.NOT_FOUND.phrase}

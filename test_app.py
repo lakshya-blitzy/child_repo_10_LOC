@@ -14,11 +14,12 @@ tree; ``PYTHONDONTWRITEBYTECODE=1`` and ``python3 -B -m unittest`` have the
 same effect by not writing it at all.
 
 Six tests across three cases, built only from the standard library: no test
-framework to install, no runner configuration, and no third-party client. The
-server under test is bound on port 0, so the suite takes an ephemeral port and
-never collides with a running ``--serve`` or with the sibling suites at the
-other two levels of the composition. Nothing here mutates ``os.environ``, reads
-or writes a file, or reaches outside this repository.
+framework to install, no runner configuration, and no third-party client. Every
+server this suite binds -- the one it hosts in-process and the one it starts as
+a child process through ``app.py --serve`` -- is bound on port 0, so the suite
+takes ephemeral ports and never collides with a running ``--serve`` or with the
+sibling suites at the other two levels of the composition. Nothing here mutates
+``os.environ``, reads or writes a file, or reaches outside this repository.
 """
 
 import contextlib
@@ -26,6 +27,7 @@ import io
 import json
 import os
 import re
+import signal
 import socket
 import struct
 import subprocess
@@ -81,10 +83,46 @@ EXPECTED_ALLOW = "GET, HEAD"
 # stripped, and once more against the bytes on the wire.
 EXPECTED_SERVER = "child_repo_10_LOC/1.0.0"
 
-# The fixed error bodies. Neither may ever grow to include the path that was
-# asked for or the method that was used.
+# The fixed error bodies. None may ever grow to include the path that was asked
+# for, the method that was used, or a field the request failed to send.
 NOT_FOUND_BODY = b'{"error":"Not Found"}'
 METHOD_NOT_ALLOWED_BODY = b'{"error":"Method Not Allowed"}'
+BAD_REQUEST_BODY = b'{"error":"Bad Request"}'
+
+# Request lines that must all be answered 404, and that only a raw socket can
+# send: urllib rewrites or refuses every one of them. Each names a target that
+# some part of the stack could be tempted to read as the route -- a run of
+# leading slashes, a target whose parsed path is empty, one that resolves to the
+# route only after ``..`` is applied, and the absolute form -- and the contract
+# is that the target is compared exactly as it arrived, so none of them is the
+# route. ``POST ///health`` is included because a foreign target must be refused
+# for what it is before the method is looked at.
+RAW_FOREIGN_REQUEST_LINES = (
+    b"GET ///health",
+    b"GET //health",
+    b"GET //health/x",
+    b"GET /a/../health",
+    b"GET http://127.0.0.1/health",
+    b"POST ///health",
+)
+
+# Request lines sent without a ``Host`` field, which RFC 9112 requires of every
+# HTTP/1.1 message. All four must be answered with the one fixed 400, whatever
+# the target and whatever the method: the field is checked before either.
+MISSING_HOST_REQUEST_LINES = (
+    b"GET /health",
+    b"HEAD /health",
+    b"GET /nope",
+    b"FOO /health",
+)
+
+# The startup line ``--serve`` prints, and the whole of it: the application's own
+# name and version, the address it really bound, and the route. Nothing else --
+# no interpreter version, no path, no process id.
+BANNER_PATTERN = re.compile(
+    r"^child_repo_10_LOC 1\.0\.0 listening on "
+    r"http://127\.0\.0\.1:(\d+)/health$"
+)
 
 # Methods the endpoint must reject, each paired with the body urllib should send.
 # POST carries an empty body so urllib really issues a POST rather than falling
@@ -228,10 +266,60 @@ def header_value(headers, name):
     return value
 
 
-class ExistingBehaviourTest(unittest.TestCase):
-    """The capability this repository had before the health endpoint existed."""
+def raw_request(port, request_line, with_host=True):
+    """Speaks one HTTP/1.1 exchange over a socket and splits the reply.
 
-    def test_the_original_greeting_is_unchanged(self):
+    Returns ``(header_block, separator, body)`` with the head and the body
+    separated at the first CRLF pair, so a caller can both prove the head was
+    terminated and count the bytes that genuinely followed the terminator.
+    ``Connection: close`` makes the server end the stream, which is what lets
+    the whole reply be read to EOF without interpreting ``Content-Length``
+    first -- often the very header under test.
+
+    A socket rather than urllib, because several of the request forms this
+    contract has to answer cannot be expressed through a client at all: urllib
+    supplies a ``Host`` field of its own, so its absence is unaskable, and it
+    rewrites or refuses a target such as ``//health`` before it reaches the
+    wire. ``with_host`` set to ``False`` is what makes the missing field
+    testable.
+
+    Response fields are read case-insensitively by the caller, never here: the
+    field name's casing is not part of the contract even when the reply is read
+    as raw bytes.
+    """
+    host_field = b""
+    if with_host:
+        authority = ("%s:%d" % (LOOPBACK_HOST, port)).encode("ascii")
+        host_field = b"Host: " + authority + b"\r\n"
+    connection = socket.create_connection(
+        (LOOPBACK_HOST, port), timeout=REQUEST_TIMEOUT
+    )
+    try:
+        connection.sendall(
+            request_line
+            + b" HTTP/1.1\r\n"
+            + host_field
+            + b"Connection: close\r\n\r\n"
+        )
+        received = b""
+        while True:
+            chunk = connection.recv(4096)
+            if not chunk:
+                break
+            received += chunk
+    finally:
+        connection.close()
+    return received.partition(b"\r\n\r\n")
+
+
+class ExistingBehaviourTest(unittest.TestCase):
+    """The capability this repository had before the health endpoint existed,
+    and the gate that keeps it: the ``--serve`` flag, whose whole purpose is
+    that the default invocation stayed exactly as it was. Both branches of that
+    gate are therefore exercised here, each in a real child process.
+    """
+
+    def test_the_greeting_is_unchanged_and_only_serve_starts_a_listener(self):
         # The module's only pre-feature behaviour, and the mechanical guarantee
         # that adding an endpoint preserved it.
         self.assertEqual("Hello Lakshya", app.greet("Lakshya"))
@@ -272,6 +360,228 @@ class ExistingBehaviourTest(unittest.TestCase):
         self.assertEqual(b"", imported.stdout)
         self.assertEqual(b"", imported.stderr)
         self.assertEqual(0, imported.returncode)
+        # The other branch of the same gate, and the only part of this module an
+        # operator ever invokes that nothing above reaches: ``serve()``, its
+        # startup banner, its bind, its request loop and its shutdown. Calling
+        # ``create_server`` -- which is what the contract case below does -- can
+        # prove none of them: it neither prints the banner, nor reads the
+        # environment, nor runs the loop, nor releases anything. So the program
+        # is started the documented way, in its own process, and made to answer.
+        self._assert_serve_binds_serves_and_releases()
+
+    def _assert_serve_binds_serves_and_releases(self):
+        """Starts ``app.py --serve``, proves it serves, then stops it.
+
+        ``PORT=0`` is passed so the child takes an ephemeral port and never
+        competes for the documented default with a developer's own server, and
+        ``HOST`` is removed from the child's environment so the loopback default
+        is what it binds. The environment is a copy: this suite never writes
+        into ``os.environ``, which every thread and later subprocess would see.
+
+        The port the child announces is the port it is then probed on, so a
+        process that printed a banner and died -- or one that bound something
+        other than what it announced -- fails here rather than passing.
+        """
+        environ = dict(os.environ, PORT="0", PYTHONDONTWRITEBYTECODE="1")
+        environ.pop("HOST", None)
+        # ``with`` closes the child's pipes and reaps it however this method
+        # leaves, so a failed assertion cannot leave a file descriptor or a
+        # zombie behind; the inner ``finally`` kills a child that is still
+        # running first, because the context manager's own wait is unbounded.
+        with subprocess.Popen(
+            [sys.executable, "-B", APP_PATH, "--serve"],
+            cwd=APP_DIRECTORY,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            env=environ,
+        ) as child:
+            remaining_stdout, errors = self._exercise_and_stop(child)
+        self.assertEqual(0, child.returncode)
+        self.assertEqual(b"", errors)
+        # The banner was the whole of the child's standard output: no access log,
+        # no shutdown notice, no second line.
+        self.assertEqual(b"", remaining_stdout)
+
+    def _exercise_and_stop(self, child):
+        """Probes a running ``--serve`` child, then interrupts it.
+
+        Returns the child's remaining standard output and its standard error.
+        The port it announced is asserted released before returning, because the
+        release is part of the shutdown this exercises.
+        """
+        try:
+            banner = self._first_line(child)
+            matched = BANNER_PATTERN.match(banner)
+            self.assertIsNotNone(
+                matched, "the startup banner was %r" % (banner,)
+            )
+            port = int(matched.group(1))
+            # An assigned ephemeral port is never the documented default, which
+            # is what proves PORT=0 reached the socket rather than being read as
+            # "unset" and silently replaced by the fallback.
+            self.assertGreater(port, 0)
+            self.assertNotEqual(app.DEFAULT_PORT, port)
+            # Something is listening on the port that was announced. Asserted
+            # before the contract probes so that a child which printed its
+            # banner and then died -- the exact failure a banner-only check
+            # cannot see -- is reported as that, rather than as a bare
+            # ConnectionRefusedError from the first request.
+            self.assertTrue(
+                self._port_accepts(port),
+                "the child announced port %d but nothing accepted a connection "
+                "there" % port,
+            )
+            # The contract, on the port the child itself named. Every shape the
+            # endpoint owes is asked for, because a listener that answers only
+            # its happy path is not the endpoint this repository documents.
+            self._assert_the_child_serves_the_contract(port)
+            # It was still running while it served, so what answered was the
+            # child and not something left over from an earlier run.
+            self.assertIsNone(child.poll(), "the child exited while serving")
+            # SIGINT is what an operator sends with Ctrl-C, and app.py catches
+            # it so the loop ends, the socket is closed and the process exits
+            # cleanly. Asserting the status and the streams is what proves that
+            # path runs: an uncaught KeyboardInterrupt would exit non-zero with
+            # a traceback naming this repository's absolute paths on stderr.
+            child.send_signal(signal.SIGINT)
+            streams = child.communicate(timeout=REQUEST_TIMEOUT)
+        finally:
+            if child.poll() is None:
+                child.kill()
+        # The socket really went with the process, so a later run can have the
+        # port back. Polled rather than asserted once, because the close and this
+        # test happen in different processes.
+        self.assertTrue(
+            self._port_is_released(port),
+            "port %d was still accepting connections after shutdown" % port,
+        )
+        return streams
+
+    @staticmethod
+    def _first_line(child):
+        """Returns the child's first line of standard output, decoded.
+
+        Read in a daemon thread so that a child which neither prints nor exits
+        fails this test on a bound instead of hanging the whole run; a daemon
+        cannot keep the interpreter alive if it is still blocked when the suite
+        ends. An empty string is returned when the child produced nothing, which
+        fails the banner match with a readable message.
+        """
+        captured = []
+
+        def read():
+            try:
+                captured.append(child.stdout.readline())
+            except (OSError, ValueError):
+                # The pipe was closed while this thread was still blocked on it,
+                # which can only happen once the bound below has expired and the
+                # test is failing anyway. Letting it out of a daemon thread would
+                # add noise to that failure rather than information.
+                captured.append(b"")
+
+        reader = threading.Thread(
+            target=read, name="serve-banner-reader", daemon=True
+        )
+        reader.start()
+        reader.join(timeout=REQUEST_TIMEOUT)
+        if not captured:
+            return ""
+        return captured[0].decode("utf-8", "replace").rstrip("\r\n")
+
+    def _assert_the_child_serves_the_contract(self, port):
+        """Asserts every answer the child owes, over a raw socket.
+
+        A served ``GET``, a bodiless ``HEAD``, and the three refusals: a target
+        that is not the route, a method the route does not allow, and a message
+        with no ``Host`` field.
+        """
+        # A served GET, and the document itself rather than only its status:
+        # this is the one place the whole path from the documented command to the
+        # wire is exercised end to end.
+        head, separator, body = raw_request(port, b"GET /health")
+        self.assertEqual(b"\r\n\r\n", separator, "GET /health head")
+        self.assertTrue(
+            head.startswith(b"HTTP/1.1 200"),
+            "GET /health status line was %r" % (head.split(b"\r\n", 1)[0],),
+        )
+        self.assertIn(b"content-type: application/json", head.lower())
+        payload = json.loads(body)
+        self.assertEqual(EXPECTED_KEYS, list(payload.keys()))
+        self.assertEqual(EXPECTED_NAME, payload["name"])
+        self.assertEqual(EXPECTED_VERSION, payload["version"])
+        self.assertEqual(EXPECTED_STATUS, payload["status"])
+        self.assertRegex(payload["timestamp"], TIMESTAMP_PATTERN)
+        # HEAD, whose header set is the GET's and whose body is nothing at all.
+        head, separator, body = raw_request(port, b"HEAD /health")
+        self.assertEqual(b"\r\n\r\n", separator, "HEAD /health head")
+        self.assertTrue(head.startswith(b"HTTP/1.1 200"), "HEAD /health status")
+        self.assertEqual(b"", body)
+        # The three refusals, each with its fixed body: a target that is not the
+        # route, a method the route does not allow, and a message with no Host.
+        for request_line, status, expected, with_host in (
+            (b"GET /nope", b"HTTP/1.1 404", NOT_FOUND_BODY, True),
+            (b"POST /health", b"HTTP/1.1 405", METHOD_NOT_ALLOWED_BODY, True),
+            (b"GET /health", b"HTTP/1.1 400", BAD_REQUEST_BODY, False),
+        ):
+            context = request_line.decode("ascii")
+            head, separator, body = raw_request(
+                port, request_line, with_host=with_host
+            )
+            self.assertEqual(b"\r\n\r\n", separator, context)
+            self.assertTrue(
+                head.startswith(status),
+                "%s status line was %r"
+                % (context, head.split(b"\r\n", 1)[0]),
+            )
+            self.assertEqual(expected, body, context)
+            self.assertNotIn(b"text/html", head.lower(), context)
+        # 405 is the one refusal that owes an Allow field, and the child must
+        # send it just as the in-process server does. The field name is matched
+        # case-insensitively and its value compared exactly, because the ``", "``
+        # spacing is part of the contract all three implementations share.
+        head = raw_request(port, b"POST /health")[0]
+        self.assertEqual(
+            [EXPECTED_ALLOW.encode("ascii")],
+            [
+                field.split(b":", 1)[1].strip()
+                for field in head.split(b"\r\n")[1:]
+                if field.lower().startswith(b"allow:")
+            ],
+            "the Allow field of a 405 from the --serve child",
+        )
+
+    @staticmethod
+    def _port_accepts(port):
+        """Polls until the port accepts a connection, or the bound expires."""
+        return ExistingBehaviourTest._port_settles(port, accepting=True)
+
+    @staticmethod
+    def _port_is_released(port):
+        """Polls until the port refuses connections, or the bound expires."""
+        return ExistingBehaviourTest._port_settles(port, accepting=False)
+
+    @staticmethod
+    def _port_settles(port, accepting):
+        """Polls a port until it is or is not accepting, within the bound.
+
+        Both directions are polled rather than probed once, because the bind and
+        the close both happen in another process: a single attempt would be a
+        race that this suite could lose either way.
+        """
+        deadline = time.monotonic() + REQUEST_TIMEOUT
+        while True:
+            try:
+                socket.create_connection(
+                    (LOOPBACK_HOST, port), timeout=REQUEST_TIMEOUT
+                ).close()
+                reached = True
+            except OSError:
+                reached = False
+            if reached == accepting:
+                return True
+            if time.monotonic() >= deadline:
+                return False
+            time.sleep(FRESHNESS_POLL_INTERVAL)
 
     @staticmethod
     def _run(*arguments):
@@ -475,26 +785,35 @@ class HealthEndpointContractTest(unittest.TestCase):
         finally:
             error.close()
 
-    def _raw_exchange(self, request_line):
-        """Speaks one HTTP/1.1 exchange over a socket and splits the reply.
+    def _raw_exchange(self, request_line, with_host=True):
+        """Returns ``(header_block, body)`` for one exchange over a socket.
 
-        Returns ``(header_block, body)`` with the two separated at the first
-        CRLF pair, so the caller can count the bytes that genuinely followed the
-        header terminator. ``Connection: close`` makes the server end the
-        stream, which is what lets the whole reply be read to EOF without
-        interpreting ``Content-Length`` first -- the very header under test.
+        Delegates to :func:`raw_request` against the port this class bound, and
+        asserts here what every reply owes regardless of its status: a
+        terminated head.
         """
-        host, port = self.server.server_address[:2]
+        port = self.server.server_address[1]
+        header_block, separator, body = raw_request(
+            port, request_line, with_host=with_host
+        )
+        self.assertEqual(
+            b"\r\n\r\n", separator, "the response head was never terminated"
+        )
+        return header_block, body
+
+    def _exchange_verbatim(self, raw):
+        """Sends ``raw`` byte for byte and returns the whole reply.
+
+        :func:`raw_request` composes the message it sends, which is what most
+        cases want; this sends exactly the bytes given, so the request version
+        and the header block are the test's to choose. Every response from this
+        endpoint closes its connection, so reading to EOF is complete.
+        """
         connection = socket.create_connection(
-            (host, port), timeout=REQUEST_TIMEOUT
+            self.server.server_address[:2], timeout=REQUEST_TIMEOUT
         )
         try:
-            connection.sendall(
-                request_line
-                + b" HTTP/1.1\r\nHost: "
-                + ("%s:%d" % (host, port)).encode("ascii")
-                + b"\r\nConnection: close\r\n\r\n"
-            )
+            connection.sendall(raw)
             received = b""
             while True:
                 chunk = connection.recv(4096)
@@ -503,11 +822,55 @@ class HealthEndpointContractTest(unittest.TestCase):
                 received += chunk
         finally:
             connection.close()
-        header_block, separator, body = received.partition(b"\r\n\r\n")
-        self.assertEqual(
-            b"\r\n\r\n", separator, "the response head was never terminated"
+        return received
+
+    def _assert_a_raw_refusal(
+        self, request_line, status, expected_body, with_host=True
+    ):
+        """Asserts one raw request's whole refusal: status, envelope, silence.
+
+        The head is checked for the status, for the JSON media type, for the
+        cache directive, for a byte-accurate length and for the absence of
+        markup; the body is compared to the fixed literal it must be, and then
+        searched for every field of the request that must not have come back --
+        the target and the method it was sent with.
+        """
+        context = request_line.decode("latin1")
+        head, received = self._raw_exchange(
+            request_line, with_host=with_host
         )
-        return header_block, body
+        self.assertTrue(
+            head.startswith(b"HTTP/1.1 " + status),
+            "%s: status line was %r"
+            % (context, head.split(b"\r\n", 1)[0]),
+        )
+        lowered = head.lower()
+        self.assertIn(b"content-type: application/json", lowered, context)
+        self.assertNotIn(b"text/html", lowered, context)
+        self.assertIn(
+            b"cache-control: %s" % EXPECTED_CACHE_CONTROL.encode("ascii"),
+            lowered,
+            context,
+        )
+        self.assertIn(
+            b"content-length: %d" % len(expected_body), lowered, context
+        )
+        # Neither a 404 nor a 400 owes an Allow field, and neither may send one:
+        # naming a method that would have worked would be an answer about an
+        # address this endpoint does not serve, or about a message it never
+        # accepted. Only the 405 branch advertises it.
+        self.assertNotIn(b"\r\nallow:", lowered, context)
+        # HEAD carries the refusal's headers and none of its body, exactly as it
+        # does on the success path.
+        method, _, target = context.partition(" ")
+        self.assertEqual(
+            b"" if method == "HEAD" else expected_body, received, context
+        )
+        # The whole point of a fixed body: nothing the caller sent comes back.
+        for sent in (target.encode("latin1"), method.encode("latin1")):
+            if sent not in (b"GET", b"HEAD", b"/health"):
+                self.assertNotIn(sent, received, context)
+                self.assertNotIn(sent, head.split(b"\r\n", 1)[1], context)
 
     def _assert_the_common_headers(self, headers, body, context):
         """Asserts the headers a refusal owes just as much as a success does.
@@ -767,6 +1130,53 @@ class HealthEndpointContractTest(unittest.TestCase):
             self._assert_the_common_headers(headers, body, context)
             self.assertEqual(METHOD_NOT_ALLOWED_BODY, body, context)
             self.assertNotIn(method.encode("ascii"), body, context)
+        # The same unsupported methods against a path that is not the route.
+        # This is the precedence proof: the target is judged before the method,
+        # so a request that is wrong in both ways is a 404 and not a 405 -- and
+        # it must not advertise Allow, which would tell a caller that some method
+        # would have worked on an address this endpoint does not serve.
+        for method, data in REJECTED_METHODS:
+            context = "method %s on path /nope" % method
+            code, headers, body = self._read_error(
+                "/nope", method=method, data=data
+            )
+            self.assertEqual(404, code, context)
+            self.assertEqual("", header_value(headers, "Allow"), context)
+            self._assert_the_common_headers(headers, body, context)
+            self.assertEqual(NOT_FOUND_BODY, body, context)
+            self.assertNotIn(method.encode("ascii"), body, context)
+            self.assertNotIn(b"nope", body, context)
+        # Every target a client library cannot even send: a run of leading
+        # slashes, an empty parsed path, a ``..`` segment that resolves to the
+        # route, and the absolute form. The contract compares the target exactly
+        # as it arrived, so all of them are 404 -- which is also what the
+        # JavaScript and Java siblings answer, so a probe cannot tell the three
+        # implementations apart by asking for an unadvertised spelling.
+        for request_line in RAW_FOREIGN_REQUEST_LINES:
+            self._assert_a_raw_refusal(request_line, b"404", NOT_FOUND_BODY)
+        # And every message that omitted the Host field RFC 9112 requires of an
+        # HTTP/1.1 request: one fixed 400 whatever the target and whatever the
+        # method, because the field is checked before either is looked at.
+        for request_line in MISSING_HOST_REQUEST_LINES:
+            self._assert_a_raw_refusal(
+                request_line, b"400", BAD_REQUEST_BODY, with_host=False
+            )
+        # The rule belongs to HTTP/1.1 alone, and only the absent field breaks
+        # it. An HTTP/1.0 request owes no Host and is served; a field that
+        # arrived empty was sent, so it is served; and the field name is matched
+        # case-insensitively, exactly as the sibling implementations match it.
+        # All three are asserted so the check above cannot be over-broad.
+        for label, raw in (
+            ("HTTP/1.0 without Host", b"GET /health HTTP/1.0\r\n\r\n"),
+            ("an empty Host", b"GET /health HTTP/1.1\r\nHost:\r\n\r\n"),
+            ("a lower-case host", b"GET /health HTTP/1.1\r\nhost: x\r\n\r\n"),
+        ):
+            served = self._exchange_verbatim(raw)
+            self.assertTrue(
+                served.startswith(b"HTTP/1.1 200"),
+                "%s must still be served; status line was %r"
+                % (label, served.split(b"\r\n", 1)[0]),
+            )
         # Part 3 -- the response writer with its socket replaced by a double,
         # which is what makes the write fail exactly where this test says it
         # does instead of depending on whether a real peer's reset wins a race
